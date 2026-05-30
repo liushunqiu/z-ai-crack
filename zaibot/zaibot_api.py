@@ -121,13 +121,6 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
         max_retries: Max retry attempts for retriable errors (default 2).
     """
     captcha = None
-    if captcha_session:
-        try:
-            captcha = captcha_session.get_captcha()
-        except Exception as e:
-            print(f"[!] 主动获取 captcha 失败: {e}，将在需要时重试", file=sys.stderr)
-    elif with_captcha:
-        captcha = load_captcha_cache()
 
     last_error = None
     for attempt in range(max_retries + 1):
