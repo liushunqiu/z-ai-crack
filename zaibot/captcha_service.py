@@ -20,8 +20,12 @@ STATE_FILE = BASE_DIR / "zaibot_state.json"
 SCENE_ID = "didk33e0"
 
 
-def _trigger_captcha_flow(page, *, click_send: bool = True) -> tuple:
-    """Trigger captcha flow on an already-loaded page and return (certify_id, security_token)."""
+def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 10) -> tuple:
+    """Trigger captcha flow on an already-loaded page and return (certify_id, security_token).
+
+    Uses exponential backoff: timeout 3s→20s, sleep 2s→10s.
+    Default 10 retries, total max wait ~3-4 min.
+    """
     # Prepare input
     page.evaluate("""() => {
         const ta = document.getElementById('chat-input');
@@ -39,11 +43,15 @@ def _trigger_captcha_flow(page, *, click_send: bool = True) -> tuple:
     certify_id = None
     security_token = None
 
-    for attempt in range(15):
+    for attempt in range(max_retries):
+        # Exponential backoff: 3s * 1.5^attempt, capped at 20s
+        timeout_sec = min(3.0 * (1.5 ** attempt), 20.0)
+        timeout_ms = int(timeout_sec * 1000)
+
         try:
             with page.expect_response(
                 lambda r: "captcha-open-southeast" in r.url or "captcha-open-ga" in r.url,
-                timeout=10000,
+                timeout=timeout_ms,
             ) as resp_info:
                 if attempt == 0 and click_send:
                     page.evaluate("""() => {
@@ -70,12 +78,17 @@ def _trigger_captcha_flow(page, *, click_send: bool = True) -> tuple:
         except Exception as e:
             err_str = str(e)
             if "Timeout" in err_str or "timeout" in err_str:
-                print(f"[*] Attempt {attempt + 1}: timeout waiting for captcha response", file=sys.stderr)
+                print(f"[*] Attempt {attempt + 1}/{max_retries}: timeout ({timeout_sec:.1f}s)", file=sys.stderr)
+                # Backoff sleep between retries
+                backoff = min(2.0 * (1.5 ** attempt), 10.0)
+                time.sleep(backoff)
                 continue
+            # Non-timeout errors: log and re-raise immediately
+            print(f"[!] Attempt {attempt + 1}: unexpected error: {e}", file=sys.stderr)
             raise
 
     if not security_token:
-        raise RuntimeError(f"Failed to get securityToken after {attempt + 1} attempts")
+        raise RuntimeError(f"Failed to get securityToken after {max_retries} attempts")
 
     return certify_id, security_token
 

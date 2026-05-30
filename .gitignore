@@ -11,6 +11,8 @@ build/
 .cache/
 
 # Sensitive token/cache files
+zaibot/zaibot_state.json
+zaibot/zaibot_token.txt
 zaibot/zaibot_preid_token.txt
 zaibot/zaibot_sg_web_token.txt
 zaibot/zaibot_signature_cache.json
@@ -20,3 +22,4 @@ zaibot/captured_chrome_chat.json
 zaibot/captured_data_fields.json
 zaibot/captured_request.json
 zaibot/captcha_analysis_chrome.json
+zaibot/hmac_secret.json

@@ -24,7 +24,7 @@ def get_user_role(token):
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
         return result.get("role")
-    except:
+    except Exception:
         return None
 
 def is_real_user(role):
