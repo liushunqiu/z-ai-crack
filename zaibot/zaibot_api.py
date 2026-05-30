@@ -120,7 +120,13 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
         chat_session: Optional ChatSession for conversation continuity.
         max_retries: Max retry attempts for retriable errors (default 2).
     """
+    # Get captcha BEFORE making the request to avoid creating bad chat state
     captcha = None
+    if captcha_session:
+        try:
+            captcha = captcha_session.get_captcha()
+        except Exception as e:
+            print(f"[!] 获取 captcha 失败: {e}，将在需要时重试", file=sys.stderr)
 
     last_error = None
     for attempt in range(max_retries + 1):
@@ -137,15 +143,12 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
         except (ZaibotHTTPError, ZaibotAPIError) as e:
             kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
             last_error = e
-            # Print actual error details for debugging
             if isinstance(e, ZaibotHTTPError):
                 print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status} {kind}", file=sys.stderr)
-                print(f"[!] Response: {e.body[:500]}", file=sys.stderr)
             else:
                 print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}", file=sys.stderr)
-                print(f"[!] Response: {e.body[:500]}", file=sys.stderr)
 
-            # Signature errors are never retriable — need manual fix
+            # Signature errors are never retriable
             if "X-Signature" in kind or "签名" in kind:
                 raise ZaibotError(
                     "X-Signature 已失效或参数不匹配。处理方式：\n"
@@ -160,8 +163,7 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
 
             # For retriable errors, get fresh captcha and retry
             if is_retriable_error(kind):
-                # Only reset chat_id for non-captcha errors (e.g. INTERNAL_ERROR)
-                # Captcha errors: keep chat_id for conversation continuity
+                # Non-captcha errors: reset chat_id (bad server state)
                 if "captcha" not in kind and "验证码" not in kind:
                     if chat_session:
                         chat_session.chat_id = None
@@ -178,7 +180,6 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
                     print(f"[*] 重试中...", file=sys.stderr)
                     continue
 
-            # Non-retriable or exhausted retries
             raise ZaibotError(f"请求失败: {kind}") from last_error
 
     raise ZaibotError(f"请求失败，已重试 {max_retries} 次") from last_error
