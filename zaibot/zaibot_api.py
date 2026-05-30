@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import sys
 import subprocess
+import time
 
 from zaibot_core import (
     ChatSession,
