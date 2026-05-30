@@ -118,7 +118,7 @@ def get_captcha_verify_param(headless: bool = True, save: bool = True, timeout: 
         page = context.new_page()
 
         print(f"[*] Navigating to chat.z.ai...", file=sys.stderr)
-        page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
+        page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_selector("#chat-input", timeout=15000)
         print(f"[*] Page ready: {page.title()}", file=sys.stderr)
         time.sleep(2)
@@ -193,7 +193,7 @@ class CaptchaSession:
 
         page = self._context.new_page()
         try:
-            page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
+            page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("#chat-input", timeout=15000)
             time.sleep(1)
 
