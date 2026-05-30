@@ -101,11 +101,11 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
     except Exception as svc_err:
         print(f"[!] Camoufox 验证码失败: {svc_err}", file=sys.stderr)
         try:
-            from auto_captcha import get_auto_captcha
+            from tools.auto_captcha import get_auto_captcha
             captcha = get_auto_captcha()
         except Exception as auto_err:
             print(f"[!] 自动验证码失败: {auto_err}", file=sys.stderr)
-            from get_captcha import get_captcha
+            from tools.get_captcha import get_captcha
             captcha = get_captcha()
     if not captcha:
         raise ZaibotError("获取 captcha_verify_param 失败")
