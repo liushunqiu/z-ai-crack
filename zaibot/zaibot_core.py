@@ -448,6 +448,7 @@ def build_headers(token: str, signature: str) -> Dict[str, str]:
         "Accept-Language": "en-US",
         "Origin": "https://chat.z.ai",
         "Referer": "https://chat.z.ai/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         "X-FE-Version": fe_version,
         "X-Region": "overseas",
         "X-Signature": signature,

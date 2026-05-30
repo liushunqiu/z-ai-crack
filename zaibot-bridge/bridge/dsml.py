@@ -182,18 +182,19 @@ _TOOL_CALL_INSTRUCTIONS = """TOOL CALL FORMAT — FOLLOW EXACTLY:
 
 RULES:
 1) Use the <|DSML|tool_calls> wrapper format.
-2) Put one or more <|DSML|invoke> entries under a single <|DSML|tool_calls> root.
+2) Put ALL invokes in a SINGLE <|DSML|tool_calls> block. Never output multiple separate blocks.
 3) Put the tool name in the invoke name attribute: <|DSML|invoke name="TOOL_NAME">.
 4) All string values must use <![CDATA[...]]>, even short ones. This includes code, scripts, file contents, prompts, paths, names, and queries.
 5) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">...</|DSML|parameter> node.
-6) Objects use nested XML elements inside the parameter body. Arrays may repeat <item> children.
+6) Objects use nested XML elements inside the parameter body. Arrays use <item> children. Do NOT put raw JSON strings as parameter values for arrays/objects — use XML structure.
 7) Numbers, booleans, and null stay plain text.
 8) Use only the parameter names in the tool schema. Do not invent fields.
 9) Do NOT wrap XML in markdown fences. Do NOT output explanations, role markers, or internal monologue.
 10) If you call a tool, the first non-whitespace characters of that tool block must be exactly <|DSML|tool_calls>.
 11) Never omit the opening <|DSML|tool_calls> tag, even if you already plan to close with </|DSML|tool_calls>.
 12) Compatibility note: the runtime also accepts the legacy XML tags <tool_calls> / <invoke> / <parameter>, but prefer the DSML-prefixed form above.
-13) CRITICAL for file writing tools (Write, write_file, write_to_file, write_stdin, create_file, etc.):
+13) Closing tags must end with > only, never |> . Correct: </|DSML|parameter>  Wrong: </|DSML|parameter>|  Similarly, opening tags: <|DSML|tool_calls> not <|DSML|tool_calls|>
+14) CRITICAL for file writing tools (Write, write_file, write_to_file, write_stdin, create_file, etc.):
     - The "content" parameter must contain ONLY the raw file content.
     - Do NOT wrap content in shell commands like heredoc (<< 'EOF' ... EOF), cat, echo, printf, tee, or any other shell syntax.
     - Do NOT include file path in the content (use the "file_path" parameter instead).
@@ -210,6 +211,7 @@ PARAMETER SHAPES:
 - object => <|DSML|parameter name="x"><field>...</field></|DSML|parameter>
 - array => <|DSML|parameter name="x"><item>...</item><item>...</item></|DSML|parameter>
 - number/bool/null => <|DSML|parameter name="x">plain_text</|DSML|parameter>
+- array of objects => <|DSML|parameter name="x"><item><step><![CDATA[do A]]></step><status><![CDATA[pending]]></status></item><item><step><![CDATA[do B]]></step><status><![CDATA[pending]]></status></item></|DSML|parameter>
 
 【WRONG — Do NOT do these】:
 
@@ -222,8 +224,22 @@ Wrong 2 — Markdown code fences:
 Wrong 3 — missing opening wrapper:
   <|DSML|invoke name="TOOL_NAME">...</|DSML|invoke>
   </|DSML|tool_calls>
+Wrong 4 — trailing pipe after tags (NEVER do this):
+  <|DSML|tool_calls|><|DSML|invoke name="TOOL_NAME"><|DSML|parameter name="x"><![CDATA[value]]></|DSML|parameter>|</|DSML|invoke>|</|DSML|tool_calls|>
+  The | after </|DSML|parameter>, </|DSML|invoke>, and </|DSML|tool_calls> is WRONG. Tags must end with > only.
+Wrong 5 — natural language before tool call:
+  Let me create the file for you.
+  <|DSML|tool_calls>...</|DSML|tool_calls>
+  The tool call block must be the FIRST thing in your response. No text before it.
+Wrong 6 — multiple separate tool_calls blocks:
+  <|DSML|tool_calls>...</|DSML|tool_calls>
+  <|DSML|tool_calls>...</|DSML|tool_calls>
+  ALL invokes must be in ONE block.
+Wrong 7 — raw JSON as parameter value:
+  <|DSML|parameter name="plan"><![CDATA[{"step":"do X","status":"pending"}]]></|DSML|parameter>
+  Use XML structure for objects/arrays, not JSON strings.
 
-Remember: The ONLY valid way to use tools is the <|DSML|tool_calls>...</|DSML|tool_calls> block at the end of your response.
+Remember: The ONLY valid way to use tools is the <|DSML|tool_calls>...</|DSML|tool_calls> block at the end of your response. When calling tools, output ONLY the tool call block — no natural language before or after.
 """
 
 

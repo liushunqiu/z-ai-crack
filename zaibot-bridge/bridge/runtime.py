@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import uuid
 from typing import AsyncIterator
 
@@ -144,108 +145,96 @@ class ChatRuntimeService:
 
                     print(f"[*] 发送请求到 Z.ai (chat_id={chat_id})...", file=sys.stderr)
 
-                    # 使用 http.client 代替 urllib.request（避免 WAF 405）
-                    import http.client
-                    conn = http.client.HTTPSConnection("chat.z.ai", timeout=180)
-                    conn.request("POST", path, body=body, headers=headers)
-                    resp = conn.getresponse()
+                    # 使用浏览器内 fetch 发请求（真实 TLS 指纹+cookies，绕过 WAF 405）
+                    browser_ctx = _get_captcha_session()._context
+                    page = browser_ctx.new_page()
+                    try:
+                        page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(1)
 
-                    content_type = (resp.getheader("content-type") or "").lower()
-                    print(f"[*] 响应: status={resp.status}, content-type={content_type}", file=sys.stderr)
+                        # 构造 fetch 请求头（浏览器内用的头，去掉 Origin/Referer 等浏览器自动加的）
+                        fetch_headers = {
+                            "Authorization": headers["Authorization"],
+                            "Content-Type": "application/json",
+                            "Accept": "text/event-stream, application/json",
+                            "X-FE-Version": headers.get("X-FE-Version", ""),
+                            "X-Region": headers.get("X-Region", ""),
+                            "X-Signature": headers.get("X-Signature", ""),
+                        }
+                        body_str = body.decode("utf-8")
 
-                    if resp.status >= 400:
-                        err_body = resp.read().decode("utf-8", errors="replace")
-                        print(f"[!] HTTP 错误: status={resp.status}, body={err_body[:500]}", file=sys.stderr)
-                        conn.close()
-                        raise zaibot_core.ZaibotHTTPError(resp.status, err_body, f"https://chat.z.ai{path}")
+                        result = page.evaluate('''async ([url, headers, body]) => {
+                            try {
+                                const resp = await fetch(url, {
+                                    method: 'POST',
+                                    headers: headers,
+                                    body: body,
+                                });
+                                const text = await resp.text();
+                                return {status: resp.status, ok: resp.ok, body: text};
+                            } catch(e) {
+                                return {error: e.message};
+                            }
+                        }''', [f"https://chat.z.ai{path}", fetch_headers, body_str])
+                    finally:
+                        page.close()
 
-                    # 包装成类文件对象以兼容后续代码
-                    class _HttpResponse:
-                        def __init__(self, resp, conn):
-                            self._resp = resp
-                            self._conn = conn
-                            self.headers = resp
-                        def __iter__(self):
-                            return self
-                        def __next__(self):
-                            line = self._resp.readline()
-                            if not line:
-                                raise StopIteration
-                            return line
-                        def read(self, size=-1):
-                            return self._resp.read(size)
-                        def close(self):
-                            self._conn.close()
-                        def __enter__(self):
-                            return self
-                        def __exit__(self, *args):
-                            self.close()
+                    if "error" in result:
+                        raise zaibot_core.ZaibotHTTPError(0, result["error"], f"https://chat.z.ai{path}")
 
-                    resp = _HttpResponse(resp, conn)
+                    resp_status = result["status"]
+                    raw_body = result["body"]
+                    print(f"[*] 响应: status={resp_status}, body_len={len(raw_body)}", file=sys.stderr)
 
-                    if "text/event-stream" in content_type:
-                        for raw_line in resp:
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                            if not line or line == "data: [DONE]":
-                                continue
-                            if not line.startswith("data: "):
-                                continue
-                            try:
-                                data = json.loads(line[6:])
-                            except json.JSONDecodeError:
-                                continue
+                    if resp_status >= 400:
+                        print(f"[!] HTTP 错误: status={resp_status}, body={raw_body[:500]}", file=sys.stderr)
+                        raise zaibot_core.ZaibotHTTPError(resp_status, raw_body, f"https://chat.z.ai{path}")
 
-                            err = zaibot_core._extract_error_payload(data)
-                            if err:
-                                err_str = json.dumps(err, ensure_ascii=False)
-                                kind = zaibot_core.classify_error(200, err_str)
-                                last_error = err_str
-                                print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
-                                if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
-                                    print(f"[*] 可重试错误，保留 chat_id 并重试...", file=sys.stderr)
-                                    break  # 重试（保留 chat_id，下次获取新 captcha）
-                                return [StreamError(err_str)]
-
-                            payload = data.get("data", {}) if isinstance(data, dict) else {}
-                            if isinstance(payload, str):
-                                continue
-                            if isinstance(payload, dict):
-                                phase = payload.get("phase")
-                                delta_content = payload.get("delta_content")
-                                if phase == "thinking" and delta_content:
-                                    events.append(ThinkingDelta(delta_content))
-                                elif phase == "answer" and delta_content:
-                                    for ev in tool_parser.feed(delta_content):
-                                        events.append(ev)
-
-                        # 如果 break 了（captcha 重试），events 为空，继续循环
-                        if not events and attempt < max_retries:
-                            print(f"[*] SSE 流结束但无事件 (attempt {attempt})，重试...", file=sys.stderr)
+                    # 解析 SSE 或 JSON 响应
+                    for raw_line in raw_body.split("\n"):
+                        line = raw_line.strip()
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                        except json.JSONDecodeError:
                             continue
 
-                        # 流结束
-                        for ev in tool_parser.flush():
-                            events.append(ev)
-                        session.last_assistant_id = assistant_id
-                        return events
-
-                    else:
-                        raw = resp.read()
-                        data = json.loads(raw)
                         err = zaibot_core._extract_error_payload(data)
                         if err:
                             err_str = json.dumps(err, ensure_ascii=False)
                             kind = zaibot_core.classify_error(200, err_str)
                             last_error = err_str
+                            print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
                             if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
-                                continue
+                                print(f"[*] 可重试错误，保留 chat_id 并重试...", file=sys.stderr)
+                                break
                             return [StreamError(err_str)]
 
-                        result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if result:
-                            events.append(TextDelta(result))
-                        session.last_assistant_id = assistant_id
-                        return events
+                        payload = data.get("data", {}) if isinstance(data, dict) else {}
+                        if isinstance(payload, str):
+                            continue
+                        if isinstance(payload, dict):
+                            phase = payload.get("phase")
+                            delta_content = payload.get("delta_content")
+                            if phase == "thinking" and delta_content:
+                                events.append(ThinkingDelta(delta_content))
+                            elif phase == "answer" and delta_content:
+                                for ev in tool_parser.feed(delta_content):
+                                    events.append(ev)
+
+                    # 如果 break 了（captcha 重试），events 为空，继续循环
+                    if not events and attempt < max_retries:
+                        print(f"[*] SSE 流结束但无事件 (attempt {attempt})，重试...", file=sys.stderr)
+                        continue
+
+                    # 流结束
+                    for ev in tool_parser.flush():
+                        events.append(ev)
+                    session.last_assistant_id = assistant_id
+                    return events
 
                 except zaibot_core.ZaibotHTTPError as e:
                     kind = zaibot_core.classify_error(e.status, e.body)
