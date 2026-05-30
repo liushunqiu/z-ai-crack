@@ -69,8 +69,6 @@ def _try_protocol_captcha() -> str | None:
 
 
 def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
-    # captcha_verify_param is one-time. After the server asks for captcha or
-    # rejects one, never reuse cache; always mint a fresh token unless forbidden.
     captcha = _try_protocol_captcha()
     if captcha:
         return captcha
@@ -81,16 +79,21 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
             "仍需继续还原，所以当前 --no-browser 无法自动生成最终 securityToken。"
         )
 
-    # Prefer persistent session if available
+    # Persistent session: retry up to 3 times, don't fall through to one-shot
+    # browser (launching a second Camoufox conflicts with the existing one).
     if captcha_session:
-        print("[*] 服务端需要验证码，使用持久浏览器获取 captcha_verify_param...", file=sys.stderr)
-        try:
-            return captcha_session.get_captcha()
-        except Exception as sess_err:
-            print(f"[!] 持久浏览器获取失败: {sess_err}", file=sys.stderr)
-            # Fall through to one-shot browser
+        for attempt in range(3):
+            print(f"[*] 使用持久浏览器获取 captcha (attempt {attempt + 1}/3)...", file=sys.stderr)
+            try:
+                return captcha_session.get_captcha()
+            except Exception as sess_err:
+                print(f"[!] 持久浏览器获取失败: {sess_err}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(2)
+        raise ZaibotError("持久浏览器获取 captcha 失败，已重试 3 次")
 
-    print("[*] 服务端需要验证码，启动 Camoufox 自动获取 captcha_verify_param...", file=sys.stderr)
+    # No persistent session: launch one-shot Camoufox
+    print("[*] 启动 Camoufox 获取 captcha_verify_param...", file=sys.stderr)
     try:
         from captcha_service import get_captcha_verify_param
         captcha = get_captcha_verify_param()
@@ -100,7 +103,7 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
             from auto_captcha import get_auto_captcha
             captcha = get_auto_captcha()
         except Exception as auto_err:
-            print(f"[!] 自动验证码失败，回退到手动滑块: {auto_err}", file=sys.stderr)
+            print(f"[!] 自动验证码失败: {auto_err}", file=sys.stderr)
             from get_captcha import get_captcha
             captcha = get_captcha()
     if not captcha:
