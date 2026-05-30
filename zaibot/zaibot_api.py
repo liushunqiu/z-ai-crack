@@ -190,11 +190,11 @@ def interactive(args: argparse.Namespace) -> None:
 
     print("Z.ai API interactive. Ctrl-D/Ctrl-C 退出。", file=sys.stderr)
 
-    # Start persistent browser session (unless --no-browser)
+    headless = not args.no_headless
     captcha_sess = None
     if not args.no_browser:
         try:
-            captcha_sess = CaptchaSession(headless=True)
+            captcha_sess = CaptchaSession(headless=headless)
             captcha_sess.start()
         except Exception as e:
             print(f"[!] 持久浏览器启动失败，回退到按需启动: {e}", file=sys.stderr)
@@ -236,10 +236,11 @@ def _single_shot(prompt: str, args: argparse.Namespace) -> int:
     """Single-prompt mode: use persistent session to keep browser alive during API call."""
     from captcha_service import CaptchaSession
 
+    headless = not args.no_headless
     captcha_sess = None
     if not args.no_browser:
         try:
-            captcha_sess = CaptchaSession(headless=True)
+            captcha_sess = CaptchaSession(headless=headless)
             captcha_sess.start()
         except Exception as e:
             print(f"[!] 持久浏览器启动失败: {e}", file=sys.stderr)
@@ -277,6 +278,7 @@ def main() -> int:
     ap.add_argument("--model", default="GLM-5.1")
     ap.add_argument("--no-stream", action="store_true", help="request non-stream response")
     ap.add_argument("--no-browser", action="store_true", help="never open browser for captcha fallback")
+    ap.add_argument("--no-headless", action="store_true", help="run browser in visible mode (more stable captcha)")
     ap.add_argument("--with-captcha", action="store_true", help="include cached captcha on first attempt if available")
     ap.add_argument("--allow-stale-signature", action="store_true", help="allow stale captured_request signature fallback")
     ap.add_argument("--chat-id", default=None, help="continue an existing chat by ID")
