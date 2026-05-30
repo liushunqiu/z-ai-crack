@@ -148,16 +148,15 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
                 "  3) 临时加 --allow-stale-signature 使用 captured_request.json 最新样本。"
             ) from e
 
-        # For captcha or any other error (e.g. INTERNAL_ERROR), reset chat_id
-        # and retry — the failed request may have left the chat in a bad state.
-        if chat_session:
-            chat_session.chat_id = None
-
         if "captcha" in kind or "验证码" in kind:
+            # Chat is fine — only the captcha token was invalid. Keep chat_id
+            # so the retry continues in the same conversation with full history.
             captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
         else:
-            # For non-captcha errors, get a fresh captcha anyway (server may
-            # have invalidated the token as part of the error handling).
+            # For non-captcha errors (e.g. INTERNAL_ERROR), reset chat_id —
+            # the failed request may have left the chat in a bad state.
+            if chat_session:
+                chat_session.chat_id = None
             try:
                 captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
             except Exception:
