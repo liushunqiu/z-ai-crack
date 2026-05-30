@@ -439,6 +439,8 @@ def load_cookie_header(domain_suffix: str = "chat.z.ai") -> str:
 
 
 def build_headers(token: str, signature: str) -> Dict[str, str]:
+    # Strip 'prod-fe-' prefix from version (API expects plain version like '1.1.38')
+    fe_version = FE_VERSION.removeprefix("prod-fe-") if FE_VERSION.startswith("prod-fe-") else FE_VERSION
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -446,7 +448,7 @@ def build_headers(token: str, signature: str) -> Dict[str, str]:
         "Accept-Language": "en-US",
         "Origin": "https://chat.z.ai",
         "Referer": "https://chat.z.ai/",
-        "X-FE-Version": FE_VERSION,
+        "X-FE-Version": fe_version,
         "X-Region": "overseas",
         "X-Signature": signature,
     }
