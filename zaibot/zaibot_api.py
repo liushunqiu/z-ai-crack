@@ -33,6 +33,7 @@ from zaibot_core import (
     ZaibotError,
     ZaibotHTTPError,
     classify_error,
+    is_retriable_error,
     load_captcha_cache,
     post_chat,
 )
@@ -107,16 +108,14 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
     return captcha
 
 
-def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser: bool = False, allow_stale_signature: bool = False, with_captcha: bool = False, captcha_session=None, chat_session: ChatSession | None = None) -> str:
+def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser: bool = False, allow_stale_signature: bool = False, with_captcha: bool = False, captcha_session=None, chat_session: ChatSession | None = None, max_retries: int = 2) -> str:
     """Send a prompt to the API.
 
     Args:
         captcha_session: Optional CaptchaSession for persistent browser reuse.
         chat_session: Optional ChatSession for conversation continuity.
-            When provided, messages are chained within the same chat.
+        max_retries: Max retry attempts for retriable errors (default 2).
     """
-    # If we have a persistent session, proactively get a fresh captcha token
-    # (every request needs one — avoids the round-trip failure + retry)
     captcha = None
     if captcha_session:
         try:
@@ -126,51 +125,60 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
     elif with_captcha:
         captcha = load_captcha_cache()
 
-    try:
-        return post_chat(
-            prompt,
-            model=model,
-            stream=stream,
-            captcha_verify_param=captcha,
-            allow_stale_signature=allow_stale_signature,
-            echo=stream,
-            session=chat_session,
-        )
-    except (ZaibotHTTPError, ZaibotAPIError) as e:
-        kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
-        print(f"[!] API 失败: {kind}", file=sys.stderr)
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return post_chat(
+                prompt,
+                model=model,
+                stream=stream,
+                captcha_verify_param=captcha,
+                allow_stale_signature=allow_stale_signature,
+                echo=stream,
+                session=chat_session,
+            )
+        except (ZaibotHTTPError, ZaibotAPIError) as e:
+            kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
+            last_error = e
+            print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}", file=sys.stderr)
 
-        if "X-Signature" in kind or "签名" in kind:
-            raise ZaibotError(
-                "X-Signature 已失效或参数不匹配。当前还没提取 HMAC secret，处理方式：\n"
-                "  1) 运行 python3 capture_signature.py 捕获新签名；或\n"
-                "  2) 设置 ZAIBOT_HMAC_SECRET 后走本地签名；或\n"
-                "  3) 临时加 --allow-stale-signature 使用 captured_request.json 最新样本。"
-            ) from e
+            # Signature errors are never retriable — need manual fix
+            if "X-Signature" in kind or "签名" in kind:
+                raise ZaibotError(
+                    "X-Signature 已失效或参数不匹配。处理方式：\n"
+                    "  1) 运行 python3 capture_signature.py 捕获新签名；或\n"
+                    "  2) 设置 ZAIBOT_HMAC_SECRET 后走本地签名；或\n"
+                    "  3) 临时加 --allow-stale-signature 使用 captured_request.json 最新样本。"
+                ) from e
 
-        if "captcha" in kind or "验证码" in kind:
-            # Chat is fine — only the captcha token was invalid. Keep chat_id
-            # so the retry continues in the same conversation with full history.
-            captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
-        else:
-            # For non-captcha errors (e.g. INTERNAL_ERROR), reset chat_id —
-            # the failed request may have left the chat in a bad state.
-            if chat_session:
-                chat_session.chat_id = None
-            try:
-                captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
-            except Exception:
-                captcha = None
+            # Token/login errors are not retriable
+            if "token" in kind or "login" in kind:
+                raise ZaibotError("登录态已失效，请运行 python3 login.py login 重新登录") from e
 
-        return post_chat(
-            prompt,
-            model=model,
-            stream=stream,
-            captcha_verify_param=captcha,
-            allow_stale_signature=allow_stale_signature,
-            echo=stream,
-            session=chat_session,
-        )
+            # For retriable errors, get fresh captcha and retry
+            if is_retriable_error(kind):
+                # Captcha errors: keep chat_id for continuity
+                # Other retriable errors: reset chat_id
+                if "captcha" not in kind and "验证码" not in kind:
+                    if chat_session:
+                        chat_session.chat_id = None
+
+                try:
+                    captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
+                except Exception as captcha_err:
+                    print(f"[!] 获取新 captcha 失败: {captcha_err}", file=sys.stderr)
+                    if attempt < max_retries:
+                        continue
+                    raise
+
+                if attempt < max_retries:
+                    print(f"[*] 重试中...", file=sys.stderr)
+                    continue
+
+            # Non-retriable or exhausted retries
+            raise ZaibotError(f"请求失败: {kind}") from last_error
+
+    raise ZaibotError(f"请求失败，已重试 {max_retries} 次") from last_error
 
 
 def interactive(args: argparse.Namespace) -> None:

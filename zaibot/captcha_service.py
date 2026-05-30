@@ -191,12 +191,11 @@ class CaptchaSession:
 
         print(f"[*] Getting fresh captcha token (new tab)...", file=sys.stderr)
 
-        # Open a fresh tab for this captcha request
         page = self._context.new_page()
         try:
             page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
             page.wait_for_selector("#chat-input", timeout=15000)
-            time.sleep(2)
+            time.sleep(1)
 
             certify_id, security_token = _trigger_captcha_flow(page)
         finally:

@@ -20,13 +20,14 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional, Generator
 
+from zaibot_core import get_fe_version
+
 BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / "zaibot_state.json"
 TOKEN_FILE = BASE_DIR / "zaibot_token.txt"
 CAPTCHA_FILE = BASE_DIR / "zaibot_captcha.json"
 
 API_BASE = "https://chat.z.ai/api"
-FE_VERSION = "prod-fe-1.1.37"
 
 
 def _get_user_id(token: str) -> str:
@@ -297,7 +298,7 @@ class ZaibotClient:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
             "Accept-Language": "en-US",
-            "X-FE-Version": FE_VERSION,
+            "X-FE-Version": get_fe_version(),
             "X-Region": "overseas",
             "X-Signature": signature,
         }

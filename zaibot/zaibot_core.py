@@ -28,9 +28,71 @@ SIGNATURE_CACHE_FILE = BASE_DIR / "zaibot_signature_cache.json"
 CAPTCHA_CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
 
 API_BASE = "https://chat.z.ai/api"
-FE_VERSION = "prod-fe-1.1.38"
 DEFAULT_MODEL = "GLM-5.1"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+FE_VERSION_CACHE_FILE = BASE_DIR / "zaibot_fe_version.json"
+_FE_VERSION_CACHE: Optional[str] = None
+
+
+def detect_fe_version(*, timeout: int = 10, max_age_hours: float = 24) -> str:
+    """Auto-detect frontend version from chat.z.ai HTML.
+
+    The version appears in <script src=".../prod-fe-X.Y.Z/assets/..."> tags.
+    Uses file cache (24h TTL) to avoid fetching on every run.
+    Falls back to a hardcoded default if detection fails.
+    """
+    import re
+
+    global _FE_VERSION_CACHE
+    if _FE_VERSION_CACHE:
+        return _FE_VERSION_CACHE
+
+    fallback = "prod-fe-1.1.38"
+
+    # Check file cache first
+    if FE_VERSION_CACHE_FILE.exists():
+        try:
+            data = json.loads(FE_VERSION_CACHE_FILE.read_text())
+            cached = data.get("version", "")
+            ts = float(data.get("timestamp", 0))
+            if cached and time.time() - ts < max_age_hours * 3600:
+                _FE_VERSION_CACHE = cached
+                return cached
+        except Exception:
+            pass
+
+    # Fetch from live page
+    try:
+        req = urllib.request.Request("https://chat.z.ai/")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read(16384).decode("utf-8", errors="replace")
+        match = re.search(r'prod-fe-[\d.]+', html)
+        if match:
+            version = match.group(0)
+            _FE_VERSION_CACHE = version
+            try:
+                FE_VERSION_CACHE_FILE.write_text(
+                    json.dumps({"version": version, "timestamp": time.time()}),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            return version
+    except Exception:
+        pass
+
+    _FE_VERSION_CACHE = fallback
+    return fallback
+
+
+def get_fe_version() -> str:
+    """Get FE_VERSION, using cached value or detecting on first call."""
+    return detect_fe_version()
+
+
+# Detect on import (non-blocking, falls back to hardcoded)
+FE_VERSION = detect_fe_version()
 
 
 class ChatSession:
@@ -404,7 +466,15 @@ def classify_error(status: int, body: str) -> str:
         return "X-Signature 失效或签名参数不匹配"
     if status == 429 or "rate" in text:
         return "限流"
+    if status >= 500:
+        return "服务端错误"
     return "未知错误"
+
+
+def is_retriable_error(kind: str) -> bool:
+    """Whether the error is worth retrying with a fresh captcha."""
+    retriable = ["captcha", "验证码", "限流", "服务端错误"]
+    return any(k in kind for k in retriable)
 
 
 def _extract_error_payload(obj: Any) -> Optional[Dict[str, Any]]:
