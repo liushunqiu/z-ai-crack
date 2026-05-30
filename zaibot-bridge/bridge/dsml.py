@@ -372,12 +372,13 @@ def format_tools_section(tools: list[dict]) -> str:
 _MAX_CAPTURE_LEN = 8192
 
 _CODE_FENCE = re.compile(r"```")
-_TOOL_CALLS_START = re.compile(r"<\|?DSML\|?tool_calls\s*>", re.IGNORECASE)
-_TOOL_CALLS_END = re.compile(r"</\|?DSML\|?tool_calls\s*>", re.IGNORECASE)
-_INVOKE_START = re.compile(r'<\|?DSML\|?invoke\s+name="([^"]+)"\s*>', re.IGNORECASE)
-_INVOKE_END = re.compile(r"</\|?DSML\|?invoke\s*>", re.IGNORECASE)
-_PARAM_START = re.compile(r'<\|?DSML\|?parameter\s+name="([^"]+)"[^>]*>', re.IGNORECASE)
-_PARAM_END = re.compile(r"</\|?DSML\|?parameter\s*>", re.IGNORECASE)
+# 支持标签末尾有 | 的格式：<|DSML|tool_calls|> 或 <|DSML|tool_calls>
+_TOOL_CALLS_START = re.compile(r"<\|?DSML\|?tool_calls\s*\|?>", re.IGNORECASE)
+_TOOL_CALLS_END = re.compile(r"</\|?DSML\|?tool_calls\s*\|?>", re.IGNORECASE)
+_INVOKE_START = re.compile(r'<\|?DSML\|?invoke\s+name="([^"]+)"\s*\|?>', re.IGNORECASE)
+_INVOKE_END = re.compile(r"</\|?DSML\|?invoke\s*\|?>", re.IGNORECASE)
+_PARAM_START = re.compile(r'<\|?DSML\|?parameter\s+name="([^"]+)"[^>]*\|?>', re.IGNORECASE)
+_PARAM_END = re.compile(r"</\|?DSML\|?parameter\s*\|?>", re.IGNORECASE)
 
 # Heredoc 提取 —— 模型有时会把内容包在 shell 命令里返回
 _HEREDOC_CAT = re.compile(
@@ -756,7 +757,10 @@ def _strip_cdata(s: str) -> str:
     t = s.strip()
     if t.startswith("<![CDATA["):
         t = t[9:]
-    if t.endswith("]]>"):
+    # 支持 ]]> 和 ]]>| 两种结尾格式
+    if t.endswith("]]>|"):
+        t = t[:-4]
+    elif t.endswith("]]>"):
         t = t[:-3]
     return t
 
