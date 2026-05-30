@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Z.ai pure-HTTP-first API client.
+
+Goal:
+  - 手动登录只做一次：python3 login.py login
+  - 后续优先直接走 HTTP API。
+  - X-Signature / captcha 都通过可替换接口提供，不再硬编码在业务逻辑里。
+
+Usage:
+  python3 zaibot_api.py "你的问题"
+  python3 zaibot_api.py --no-browser "hello"       # 绝不打开浏览器，缺 captcha/signature 就直接报错
+  python3 zaibot_api.py --allow-stale-signature "hello"
+  python3 zaibot_api.py                              # interactive
+
+Signature sources, priority:
+  1. ZAIBOT_HMAC_SECRET env -> local formula
+  2. zaibot_signature_cache.json (<=5 min by default)
+  3. captured_request.json latest request (fallback / stale mode)
+
+Captcha sources:
+  1. zaibot_captcha_cache.json (<=4 min)
+  2. if server says captcha is required and browser is allowed, call get_captcha.py logic
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import subprocess
+
+from zaibot_core import (
+    ChatSession,
+    ZaibotAPIError,
+    ZaibotError,
+    ZaibotHTTPError,
+    classify_error,
+    load_captcha_cache,
+    post_chat,
+)
+
+
+def _try_protocol_captcha() -> str | None:
+    """Try the no-browser captcha minting path.
+
+    Current protocol module has fully reproduced Aliyun OpenAPI signing and
+    InitCaptchaV3. It will return a token only after FeiLin deviceToken is also
+    reproduced; until then we fall back to Chrome unless --no-browser is set.
+    """
+    try:
+        proc = subprocess.run(
+            ["node", "captcha_protocol.js", "mint"],
+            cwd=str(__import__("pathlib").Path(__file__).parent),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+        )
+        if proc.returncode == 0:
+            raw = proc.stdout.strip().splitlines()[-1].strip()
+            if raw and not raw.startswith("{"):
+                return raw
+        if proc.stderr:
+            print(f"[*] 纯协议验证码暂不可用: {proc.stderr.strip().splitlines()[-1]}", file=sys.stderr)
+    except FileNotFoundError:
+        print("[*] 未找到 node，跳过纯协议验证码尝试", file=sys.stderr)
+    except Exception as e:
+        print(f"[*] 纯协议验证码尝试失败: {e}", file=sys.stderr)
+    return None
+
+
+def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
+    # captcha_verify_param is one-time. After the server asks for captcha or
+    # rejects one, never reuse cache; always mint a fresh token unless forbidden.
+    captcha = _try_protocol_captcha()
+    if captcha:
+        return captcha
+    if no_browser:
+        raise ZaibotError(
+            "服务端需要 captcha_verify_param，但 --no-browser 禁止打开浏览器。\n"
+            "已完成 Aliyun OpenAPI 纯协议签名与 InitCaptchaV3；剩余 FeiLin deviceToken "
+            "仍需继续还原，所以当前 --no-browser 无法自动生成最终 securityToken。"
+        )
+
+    # Prefer persistent session if available
+    if captcha_session:
+        print("[*] 服务端需要验证码，使用持久浏览器获取 captcha_verify_param...", file=sys.stderr)
+        try:
+            return captcha_session.get_captcha()
+        except Exception as sess_err:
+            print(f"[!] 持久浏览器获取失败: {sess_err}", file=sys.stderr)
+            # Fall through to one-shot browser
+
+    print("[*] 服务端需要验证码，启动 Camoufox 自动获取 captcha_verify_param...", file=sys.stderr)
+    try:
+        from captcha_service import get_captcha_verify_param
+        captcha = get_captcha_verify_param()
+    except Exception as svc_err:
+        print(f"[!] Camoufox 验证码失败: {svc_err}", file=sys.stderr)
+        try:
+            from auto_captcha import get_auto_captcha
+            captcha = get_auto_captcha()
+        except Exception as auto_err:
+            print(f"[!] 自动验证码失败，回退到手动滑块: {auto_err}", file=sys.stderr)
+            from get_captcha import get_captcha
+            captcha = get_captcha()
+    if not captcha:
+        raise ZaibotError("获取 captcha_verify_param 失败")
+    return captcha
+
+
+def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser: bool = False, allow_stale_signature: bool = False, with_captcha: bool = False, captcha_session=None, chat_session: ChatSession | None = None) -> str:
+    """Send a prompt to the API.
+
+    Args:
+        captcha_session: Optional CaptchaSession for persistent browser reuse.
+        chat_session: Optional ChatSession for conversation continuity.
+            When provided, messages are chained within the same chat.
+    """
+    # If we have a persistent session, proactively get a fresh captcha token
+    # (every request needs one — avoids the round-trip failure + retry)
+    captcha = None
+    if captcha_session:
+        try:
+            captcha = captcha_session.get_captcha()
+        except Exception as e:
+            print(f"[!] 主动获取 captcha 失败: {e}，将在需要时重试", file=sys.stderr)
+    elif with_captcha:
+        captcha = load_captcha_cache()
+
+    try:
+        return post_chat(
+            prompt,
+            model=model,
+            stream=stream,
+            captcha_verify_param=captcha,
+            allow_stale_signature=allow_stale_signature,
+            echo=stream,
+            session=chat_session,
+        )
+    except (ZaibotHTTPError, ZaibotAPIError) as e:
+        kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
+        print(f"[!] API 失败: {kind}", file=sys.stderr)
+
+        if "X-Signature" in kind or "签名" in kind:
+            raise ZaibotError(
+                "X-Signature 已失效或参数不匹配。当前还没提取 HMAC secret，处理方式：\n"
+                "  1) 运行 python3 capture_signature.py 捕获新签名；或\n"
+                "  2) 设置 ZAIBOT_HMAC_SECRET 后走本地签名；或\n"
+                "  3) 临时加 --allow-stale-signature 使用 captured_request.json 最新样本。"
+            ) from e
+
+        # For captcha or any other error (e.g. INTERNAL_ERROR), reset chat_id
+        # and retry — the failed request may have left the chat in a bad state.
+        if chat_session:
+            chat_session.chat_id = None
+
+        if "captcha" in kind or "验证码" in kind:
+            captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
+        else:
+            # For non-captcha errors, get a fresh captcha anyway (server may
+            # have invalidated the token as part of the error handling).
+            try:
+                captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
+            except Exception:
+                captcha = None
+
+        return post_chat(
+            prompt,
+            model=model,
+            stream=stream,
+            captcha_verify_param=captcha,
+            allow_stale_signature=allow_stale_signature,
+            echo=stream,
+            session=chat_session,
+        )
+
+
+def interactive(args: argparse.Namespace) -> None:
+    from captcha_service import CaptchaSession
+
+    print("Z.ai API interactive. Ctrl-D/Ctrl-C 退出。", file=sys.stderr)
+
+    # Start persistent browser session (unless --no-browser)
+    captcha_sess = None
+    if not args.no_browser:
+        try:
+            captcha_sess = CaptchaSession(headless=True)
+            captcha_sess.start()
+        except Exception as e:
+            print(f"[!] 持久浏览器启动失败，回退到按需启动: {e}", file=sys.stderr)
+            captcha_sess = None
+
+    # Chat session for conversation continuity
+    chat_sess = ChatSession(model=args.model)
+    print(f"[*] 会话模式: 所有消息在同一个聊天中", file=sys.stderr)
+
+    try:
+        while True:
+            try:
+                prompt = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                return
+            if not prompt:
+                continue
+            try:
+                ask(
+                    prompt,
+                    model=args.model,
+                    stream=not args.no_stream,
+                    no_browser=args.no_browser,
+                    allow_stale_signature=args.allow_stale_signature,
+                    with_captcha=args.with_captcha,
+                    captcha_session=captcha_sess,
+                    chat_session=chat_sess,
+                )
+            except Exception as e:
+                print(f"[x] {e}", file=sys.stderr)
+    finally:
+        if captcha_sess:
+            print("[*] 关闭持久浏览器...", file=sys.stderr)
+            captcha_sess.close()
+
+
+def _single_shot(prompt: str, args: argparse.Namespace) -> int:
+    """Single-prompt mode: use persistent session to keep browser alive during API call."""
+    from captcha_service import CaptchaSession
+
+    captcha_sess = None
+    if not args.no_browser:
+        try:
+            captcha_sess = CaptchaSession(headless=True)
+            captcha_sess.start()
+        except Exception as e:
+            print(f"[!] 持久浏览器启动失败: {e}", file=sys.stderr)
+            captcha_sess = None
+
+    # Create chat session if --chat-id is provided
+    chat_sess = None
+    if args.chat_id:
+        chat_sess = ChatSession(model=args.model)
+        chat_sess.chat_id = args.chat_id
+
+    try:
+        ask(
+            prompt,
+            model=args.model,
+            stream=not args.no_stream,
+            no_browser=args.no_browser,
+            allow_stale_signature=args.allow_stale_signature,
+            with_captcha=args.with_captcha,
+            captcha_session=captcha_sess,
+            chat_session=chat_sess,
+        )
+        return 0
+    except Exception as e:
+        print(f"[x] {e}", file=sys.stderr)
+        return 1
+    finally:
+        if captcha_sess:
+            captcha_sess.close()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Z.ai HTTP API client")
+    ap.add_argument("prompt", nargs="*", help="prompt text")
+    ap.add_argument("--model", default="GLM-5.1")
+    ap.add_argument("--no-stream", action="store_true", help="request non-stream response")
+    ap.add_argument("--no-browser", action="store_true", help="never open browser for captcha fallback")
+    ap.add_argument("--with-captcha", action="store_true", help="include cached captcha on first attempt if available")
+    ap.add_argument("--allow-stale-signature", action="store_true", help="allow stale captured_request signature fallback")
+    ap.add_argument("--chat-id", default=None, help="continue an existing chat by ID")
+    args = ap.parse_args()
+
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        interactive(args)
+        return 0
+
+    print(f"[*] {prompt}", file=sys.stderr)
+    if args.chat_id:
+        print(f"[*] 继续会话: {args.chat_id}", file=sys.stderr)
+    return _single_shot(prompt, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

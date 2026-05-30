@@ -1,0 +1,22 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.DS_Store
+*.log
+dist/
+build/
+.cache/
+
+# Sensitive token/cache files
+zaibot/zaibot_preid_token.txt
+zaibot/zaibot_sg_web_token.txt
+zaibot/zaibot_signature_cache.json
+zaibot/zaibot_captcha_cache.json
+zaibot/zaibot_captcha_batch.json
+zaibot/captured_chrome_chat.json
+zaibot/captured_data_fields.json
+zaibot/captured_request.json
+zaibot/captcha_analysis_chrome.json

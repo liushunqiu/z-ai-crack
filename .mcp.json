@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "camoufox-reverse": {
+      "command": "/Users/liushunqiu/Desktop/z-ai-crack/camoufox-reverse-mcp/.venv/bin/python",
+      "args": ["-m", "camoufox_reverse_mcp", "--headless"]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+zaibot_token.txt
+zaibot_state.json
+*.pyc
+__pycache__/
