@@ -137,7 +137,13 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
         except (ZaibotHTTPError, ZaibotAPIError) as e:
             kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
             last_error = e
-            print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}", file=sys.stderr)
+            # Print actual error details for debugging
+            if isinstance(e, ZaibotHTTPError):
+                print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status} {kind}", file=sys.stderr)
+                print(f"[!] Response: {e.body[:500]}", file=sys.stderr)
+            else:
+                print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}", file=sys.stderr)
+                print(f"[!] Response: {e.body[:500]}", file=sys.stderr)
 
             # Signature errors are never retriable — need manual fix
             if "X-Signature" in kind or "签名" in kind:
