@@ -160,9 +160,11 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
 
             # For retriable errors, get fresh captcha and retry
             if is_retriable_error(kind):
-                # Always reset chat_id — the failed request may have left it in a bad state
-                if chat_session:
-                    chat_session.chat_id = None
+                # Only reset chat_id for non-captcha errors (e.g. INTERNAL_ERROR)
+                # Captcha errors: keep chat_id for conversation continuity
+                if "captcha" not in kind and "验证码" not in kind:
+                    if chat_session:
+                        chat_session.chat_id = None
 
                 try:
                     captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
