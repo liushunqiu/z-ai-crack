@@ -112,7 +112,6 @@ def get_captcha_verify_param(headless: bool = True, save: bool = True, timeout: 
         page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_selector("#chat-input", timeout=15000)
         print(f"[*] Page ready: {page.title()}", file=sys.stderr)
-        time.sleep(2)
 
         print(f"[*] Sending message and waiting for captcha responses...", file=sys.stderr)
         certify_id, security_token = _trigger_captcha_flow(page)
@@ -155,6 +154,7 @@ class CaptchaSession:
         self._browser_ctx = None
         self._browser = None
         self._context = None
+        self._fetch_page = None
 
     def start(self):
         """Launch browser (once). No navigation yet — tabs are created on demand."""
@@ -186,7 +186,6 @@ class CaptchaSession:
         try:
             page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("#chat-input", timeout=15000)
-            time.sleep(1)
 
             certify_id, security_token = _trigger_captcha_flow(page)
         finally:
@@ -211,8 +210,68 @@ class CaptchaSession:
 
         return raw
 
+    def get_fetch_page(self):
+        """Get or create a persistent page on chat.z.ai for fetch requests."""
+        if self._fetch_page is not None:
+            try:
+                _ = self._fetch_page.url  # check if page is still alive
+                return self._fetch_page
+            except Exception:
+                self._fetch_page = None
+
+        page = self._context.new_page()
+        page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
+        self._fetch_page = page
+        print(f"[*] Persistent fetch page ready.", file=sys.stderr)
+        return page
+
+    def fetch(self, url: str, headers: dict, body: str) -> dict:
+        """Execute fetch on the persistent page. Thread-safe via page lock."""
+        page = self.get_fetch_page()
+        try:
+            return page.evaluate('''async ([url, headers, body]) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: headers,
+                        body: body,
+                    });
+                    const text = await resp.text();
+                    return {status: resp.status, ok: resp.ok, body: text};
+                } catch(e) {
+                    return {error: e.message};
+                }
+            }''', [url, headers, body])
+        except Exception:
+            # Page might have crashed, recreate and retry once
+            try:
+                self._fetch_page.close()
+            except Exception:
+                pass
+            self._fetch_page = None
+            page = self.get_fetch_page()
+            return page.evaluate('''async ([url, headers, body]) => {
+                try {
+                    const resp = await fetch(url, {
+                        method: 'POST',
+                        headers: headers,
+                        body: body,
+                    });
+                    const text = await resp.text();
+                    return {status: resp.status, ok: resp.ok, body: text};
+                } catch(e) {
+                    return {error: e.message};
+                }
+            }''', [url, headers, body])
+
     def close(self):
         """Clean up browser resources."""
+        if self._fetch_page:
+            try:
+                self._fetch_page.close()
+            except Exception:
+                pass
+            self._fetch_page = None
         if self._browser_ctx:
             try:
                 self._browser_ctx.__exit__(None, None, None)

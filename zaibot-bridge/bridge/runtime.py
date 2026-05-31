@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 import uuid
 from typing import AsyncIterator
 
@@ -145,39 +144,19 @@ class ChatRuntimeService:
 
                     print(f"[*] 发送请求到 Z.ai (chat_id={chat_id})...", file=sys.stderr)
 
-                    # 使用浏览器内 fetch 发请求（真实 TLS 指纹+cookies，绕过 WAF 405）
-                    browser_ctx = _get_captcha_session()._context
-                    page = browser_ctx.new_page()
-                    try:
-                        page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(1)
+                    # 使用持久化 fetch 页面发请求（真实 TLS 指纹+cookies，绕过 WAF 405）
+                    fetch_headers = {
+                        "Authorization": headers["Authorization"],
+                        "Content-Type": "application/json",
+                        "Accept": "text/event-stream, application/json",
+                        "X-FE-Version": headers.get("X-FE-Version", ""),
+                        "X-Region": headers.get("X-Region", ""),
+                        "X-Signature": headers.get("X-Signature", ""),
+                    }
+                    body_str = body.decode("utf-8")
 
-                        # 构造 fetch 请求头（浏览器内用的头，去掉 Origin/Referer 等浏览器自动加的）
-                        fetch_headers = {
-                            "Authorization": headers["Authorization"],
-                            "Content-Type": "application/json",
-                            "Accept": "text/event-stream, application/json",
-                            "X-FE-Version": headers.get("X-FE-Version", ""),
-                            "X-Region": headers.get("X-Region", ""),
-                            "X-Signature": headers.get("X-Signature", ""),
-                        }
-                        body_str = body.decode("utf-8")
-
-                        result = page.evaluate('''async ([url, headers, body]) => {
-                            try {
-                                const resp = await fetch(url, {
-                                    method: 'POST',
-                                    headers: headers,
-                                    body: body,
-                                });
-                                const text = await resp.text();
-                                return {status: resp.status, ok: resp.ok, body: text};
-                            } catch(e) {
-                                return {error: e.message};
-                            }
-                        }''', [f"https://chat.z.ai{path}", fetch_headers, body_str])
-                    finally:
-                        page.close()
+                    sess = _get_captcha_session()
+                    result = sess.fetch(f"https://chat.z.ai{path}", fetch_headers, body_str)
 
                     if "error" in result:
                         raise zaibot_core.ZaibotHTTPError(0, result["error"], f"https://chat.z.ai{path}")
