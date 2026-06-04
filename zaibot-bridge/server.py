@@ -39,7 +39,30 @@ runtime: ChatRuntimeService | None = None
 async def lifespan(app: FastAPI):
     global runtime
     runtime = ChatRuntimeService()
+
+    # 后台清理协程：每 60 秒 sweep 一次过期会话
+    import asyncio
+    _sweep_stop = asyncio.Event()
+
+    async def _session_sweep_loop():
+        while not _sweep_stop.is_set():
+            try:
+                await asyncio.wait_for(_sweep_stop.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                pass
+            if runtime:
+                evicted = runtime.sweep_expired_sessions()
+                if evicted:
+                    print(f"[session-cache] swept {evicted} expired sessions", file=sys.stderr)
+
+    sweep_task = asyncio.create_task(_session_sweep_loop())
     yield
+    _sweep_stop.set()
+    sweep_task.cancel()
+    try:
+        await sweep_task
+    except asyncio.CancelledError:
+        pass
     runtime = None
 
 
@@ -78,9 +101,8 @@ async def chat_completions(request: Request):
     if req.stream:
         # 流式响应
         async def generate():
-            async for chunk in runtime.execute(req):
-                async for sse in chat_adapter.to_sse_stream(iter([chunk]), req.model):
-                    yield sse
+            async for sse in chat_adapter.to_sse_stream(runtime.execute(req), req.model):
+                yield sse
 
         return StreamingResponse(
             generate(),
@@ -196,9 +218,19 @@ async def close_session(request: Request):
 @app.get("/api/status")
 async def status():
     """服务状态。"""
+    if runtime:
+        stats = runtime.session_stats()
+        return {
+            "status": "running",
+            "sessions": stats.size,
+            "session_max": stats.max_size,
+            "session_ttl_seconds": stats.ttl_seconds,
+            "evicted_ttl": stats.evicted_ttl,
+            "evicted_lru": stats.evicted_lru,
+            "timestamp": int(time.time()),
+        }
     return {
-        "status": "running",
-        "sessions": len(runtime._sessions) if runtime else 0,
+        "status": "stopped",
         "timestamp": int(time.time()),
     }
 
@@ -208,5 +240,5 @@ if __name__ == "__main__":
         "server:app",
         host="0.0.0.0",
         port=8001,  # 使用 8001 端口避免与 deepseek-bridge 冲突
-        reload=True,
+        reload=False,
     )

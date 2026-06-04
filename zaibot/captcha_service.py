@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
 import sys
 import time
 from pathlib import Path
+import threading
+from concurrent.futures import Future
 
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
@@ -139,9 +142,9 @@ def get_captcha_verify_param(headless: bool = True, save: bool = True, timeout: 
 class CaptchaSession:
     """Persistent browser session for repeated captcha token generation.
 
-    The browser stays alive across multiple get_captcha() calls. Each call
-    opens a NEW tab (page) for the captcha flow, then closes it. This avoids
-    polluting any existing page state.
+    All Playwright operations run on a dedicated worker thread to avoid
+    greenlet "Cannot switch to a different thread" errors when called from
+    FastAPI's thread pool executor.
 
     Usage:
         with CaptchaSession(headless=True) as session:
@@ -155,9 +158,43 @@ class CaptchaSession:
         self._browser = None
         self._context = None
         self._fetch_page = None
+        # Dedicated thread for ALL Playwright operations
+        self._worker_thread: threading.Thread | None = None
+        self._task_queue: queue.Queue = queue.Queue()
+
+    def _run_on_worker(self, fn, *args, **kwargs):
+        """Dispatch fn to the worker thread and wait for result."""
+        if threading.current_thread() is self._worker_thread:
+            # Already on worker thread, call directly
+            return fn(*args, **kwargs)
+        fut: Future = Future()
+        self._task_queue.put((fut, fn, args, kwargs))
+        result = fut.result()  # blocks until done
+        return result
+
+    def _worker_loop(self):
+        """Worker thread main loop: process tasks from queue."""
+        while True:
+            item = self._task_queue.get()
+            if item is None:
+                break
+            fut, fn, args, kwargs = item
+            try:
+                result = fn(*args, **kwargs)
+                fut.set_result(result)
+            except Exception as e:
+                fut.set_exception(e)
 
     def start(self):
-        """Launch browser (once). No navigation yet — tabs are created on demand."""
+        """Launch browser (once) on a dedicated worker thread."""
+        # Start worker thread first
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
+        # Launch browser on the worker thread
+        self._run_on_worker(self._start_browser)
+
+    def _start_browser(self):
         from camoufox import Camoufox
 
         if not STATE_FILE.exists():
@@ -172,11 +209,10 @@ class CaptchaSession:
         print(f"[*] Persistent browser ready.", file=sys.stderr)
 
     def get_captcha(self, save: bool = True) -> str:
-        """Get a fresh captcha token.
+        """Get a fresh captcha token. Runs on the dedicated worker thread."""
+        return self._run_on_worker(self._get_captcha_impl, save)
 
-        Opens a dedicated tab, runs the captcha flow, closes the tab.
-        The browser context (cookies, storage) persists across calls.
-        """
+    def _get_captcha_impl(self, save: bool) -> str:
         if not self._context:
             raise RuntimeError("Session not started. Call start() first.")
 
@@ -226,7 +262,10 @@ class CaptchaSession:
         return page
 
     def fetch(self, url: str, headers: dict, body: str) -> dict:
-        """Execute fetch on the persistent page. Thread-safe via page lock."""
+        """Execute fetch on the persistent page. Runs on the dedicated worker thread."""
+        return self._run_on_worker(self._fetch_impl, url, headers, body)
+
+    def _fetch_impl(self, url: str, headers: dict, body: str) -> dict:
         page = self.get_fetch_page()
         try:
             return page.evaluate('''async ([url, headers, body]) => {
@@ -264,6 +303,95 @@ class CaptchaSession:
                 }
             }''', [url, headers, body])
 
+    def fetch_streaming(self, url: str, headers: dict, body: str):
+        """Streaming fetch: yield {status, chunk, done, error} dicts.
+
+        The initial JS setup runs on the worker thread. Then we poll from the
+        calling thread — page.evaluate for polling is safe because it only
+        reads a JS global (no greenlet-sensitive operations).
+        """
+        # Start the JS streaming fetch on the worker thread
+        self._run_on_worker(self._start_streaming_fetch, url, headers, body)
+
+        # Poll from the calling thread (page.evaluate for polling is safe —
+        # it just reads a JS global array, no navigation or page creation)
+        while True:
+            items = self._run_on_worker(self._poll_stream_buffer)
+
+            for item in items["items"]:
+                yield item
+
+            if items["done"]:
+                if items["error"]:
+                    raise RuntimeError(items["error"])
+                break
+
+            time.sleep(0.05)  # 50ms 轮询间隔
+
+    def _start_streaming_fetch(self, url: str, headers: dict, body: str):
+        page = self.get_fetch_page()
+        page.evaluate('''([url, headers, body]) => {
+            window.__stream_buf = [];
+            window.__stream_done = false;
+            window.__stream_error = null;
+            (async () => {
+                try {
+                    const resp = await fetch(url, {
+                        method: "POST",
+                        headers: headers,
+                        body: body,
+                    });
+                    window.__stream_buf.push({status: resp.status, type: "status"});
+
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = "";
+                    let flushTimer = null;
+                    const FLUSH_INTERVAL = 100;
+                    const FLUSH_SIZE = 4096;
+
+                    function flush() {
+                        if (buffer.length > 0) {
+                            window.__stream_buf.push({chunk: buffer});
+                            buffer = "";
+                        }
+                        if (flushTimer) {
+                            clearTimeout(flushTimer);
+                            flushTimer = null;
+                        }
+                    }
+
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        if (buffer.length >= FLUSH_SIZE) {
+                            flush();
+                        } else if (!flushTimer) {
+                            flushTimer = setTimeout(flush, FLUSH_INTERVAL);
+                        }
+                    }
+                    flush();
+                    window.__stream_done = true;
+                } catch(e) {
+                    window.__stream_error = e.message;
+                    window.__stream_done = true;
+                }
+            })();
+        }''', [url, headers, body])
+
+    def _poll_stream_buffer(self):
+        page = self.get_fetch_page()
+        return page.evaluate('''() => {
+            const buf = window.__stream_buf || [];
+            window.__stream_buf = [];
+            return {
+                items: buf,
+                done: window.__stream_done || false,
+                error: window.__stream_error || null,
+            };
+        }''')
+
     def close(self):
         """Clean up browser resources."""
         if self._fetch_page:
@@ -280,6 +408,11 @@ class CaptchaSession:
             self._browser_ctx = None
             self._browser = None
             self._context = None
+        # Stop worker thread
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._task_queue.put(None)
+            self._worker_thread.join(timeout=5)
+            self._worker_thread = None
 
     def __enter__(self):
         self.start()

@@ -172,74 +172,43 @@ def _escape_xml_text(text: str) -> str:
 #   照搬 PromptCompatService.injectToolDefinitions + buildToolCallInstructions
 # ──────────────────────────────────────────────────────────────
 
-_TOOL_CALL_INSTRUCTIONS = """TOOL CALL FORMAT — FOLLOW EXACTLY:
+_TOOL_CALL_INSTRUCTIONS = """## TOOL CALL FORMAT (MANDATORY)
+
+When calling tools, output EXACTLY this format with NO other text:
 
 <|DSML|tool_calls>
-  <|DSML|invoke name="TOOL_NAME_HERE">
-    <|DSML|parameter name="PARAMETER_NAME"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>
+  <|DSML|invoke name="TOOL_NAME">
+    <|DSML|parameter name="PARAM"><![CDATA[VALUE]]></|DSML|parameter>
   </|DSML|invoke>
 </|DSML|tool_calls>
 
-RULES:
-1) Use the <|DSML|tool_calls> wrapper format.
-2) Put ALL invokes in a SINGLE <|DSML|tool_calls> block. Never output multiple separate blocks.
-3) Put the tool name in the invoke name attribute: <|DSML|invoke name="TOOL_NAME">.
-4) All string values must use <![CDATA[...]]>, even short ones. This includes code, scripts, file contents, prompts, paths, names, and queries.
-5) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">...</|DSML|parameter> node.
-6) Objects use nested XML elements inside the parameter body. Arrays use <item> children. Do NOT put raw JSON strings as parameter values for arrays/objects — use XML structure.
-7) Numbers, booleans, and null stay plain text.
-8) Use only the parameter names in the tool schema. Do not invent fields.
-9) Do NOT wrap XML in markdown fences. Do NOT output explanations, role markers, or internal monologue.
-10) If you call a tool, the first non-whitespace characters of that tool block must be exactly <|DSML|tool_calls>.
-11) Never omit the opening <|DSML|tool_calls> tag, even if you already plan to close with </|DSML|tool_calls>.
-12) Compatibility note: the runtime also accepts the legacy XML tags <tool_calls> / <invoke> / <parameter>, but prefer the DSML-prefixed form above.
-13) Closing tags must end with > only, never |> . Correct: </|DSML|parameter>  Wrong: </|DSML|parameter>|  Similarly, opening tags: <|DSML|tool_calls> not <|DSML|tool_calls|>
-14) CRITICAL for file writing tools (Write, write_file, write_to_file, write_stdin, create_file, etc.):
-    - The "content" parameter must contain ONLY the raw file content.
-    - Do NOT wrap content in shell commands like heredoc (<< 'EOF' ... EOF), cat, echo, printf, tee, or any other shell syntax.
-    - Do NOT include file path in the content (use the "file_path" parameter instead).
-    - Do NOT add any shell redirections (> or >>) in the content.
-    - WRONG examples (NEVER do these):
-      * cat > file.txt << 'EOF'\ncontent\nEOF
-      * echo "content" > file.txt
-      * printf "content" > file.txt
-      * tee file.txt << 'EOF'\ncontent\nEOF
-    - CORRECT: Just provide the pure content directly.
+## CRITICAL RULES
 
-PARAMETER SHAPES:
-- string => <|DSML|parameter name="x"><![CDATA[value]]></|DSML|parameter>
-- object => <|DSML|parameter name="x"><field>...</field></|DSML|parameter>
-- array => <|DSML|parameter name="x"><item>...</item><item>...</item></|DSML|parameter>
-- number/bool/null => <|DSML|parameter name="x">plain_text</|DSML|parameter>
-- array of objects => <|DSML|parameter name="x"><item><step><![CDATA[do A]]></step><status><![CDATA[pending]]></status></item><item><step><![CDATA[do B]]></step><status><![CDATA[pending]]></status></item></|DSML|parameter>
+1. **Output ONLY the tool call block** — no text before or after, no markdown fences, no explanations.
+2. **ALL tools in ONE block** — put multiple <|DSML|invoke> inside a single <|DSML|tool_calls>.
+3. **Strings use CDATA** — wrap ALL string values in <![CDATA[...]]> (code, paths, content, etc).
+4. **Objects/Arrays use XML structure** — NOT raw JSON. Objects = nested parameters, Arrays = <item> children.
+5. **Numbers/booleans/null = plain text** — no quotes, no CDATA.
+6. **Use exact parameter names** from the tool schema. Do not invent fields.
+7. **Creating new files** — use the Write/write_file tool directly. Do NOT use Bash with heredoc/echo/cat/printf to create files.
+8. **Editing existing files** — use the apply_patch tool with unified diff format. Do NOT use sed/awk or Bash to edit files.
+9. **File content = raw content only** — in Write tool, provide pure file content without any shell syntax.
 
-【WRONG — Do NOT do these】:
+## PARAMETER EXAMPLES
 
-Wrong 1 — mixed text after XML:
-  <|DSML|tool_calls>...</|DSML|tool_calls> I hope this helps.
-Wrong 2 — Markdown code fences:
-  ```xml
-  <|DSML|tool_calls>...</|DSML|tool_calls>
-  ```
-Wrong 3 — missing opening wrapper:
-  <|DSML|invoke name="TOOL_NAME">...</|DSML|invoke>
-  </|DSML|tool_calls>
-Wrong 4 — trailing pipe after tags (NEVER do this):
-  <|DSML|tool_calls|><|DSML|invoke name="TOOL_NAME"><|DSML|parameter name="x"><![CDATA[value]]></|DSML|parameter>|</|DSML|invoke>|</|DSML|tool_calls|>
-  The | after </|DSML|parameter>, </|DSML|invoke>, and </|DSML|tool_calls> is WRONG. Tags must end with > only.
-Wrong 5 — natural language before tool call:
-  Let me create the file for you.
-  <|DSML|tool_calls>...</|DSML|tool_calls>
-  The tool call block must be the FIRST thing in your response. No text before it.
-Wrong 6 — multiple separate tool_calls blocks:
-  <|DSML|tool_calls>...</|DSML|tool_calls>
-  <|DSML|tool_calls>...</|DSML|tool_calls>
-  ALL invokes must be in ONE block.
-Wrong 7 — raw JSON as parameter value:
-  <|DSML|parameter name="plan"><![CDATA[{"step":"do X","status":"pending"}]]></|DSML|parameter>
-  Use XML structure for objects/arrays, not JSON strings.
+String:  <|DSML|parameter name="path"><![CDATA[/tmp/file.txt]]></|DSML|parameter>
+Object:  <|DSML|parameter name="config"><port><![CDATA[8080]]></port><host><![CDATA[localhost]]></host></|DSML|parameter>
+Array:   <|DSML|parameter name="items"><item><![CDATA[a]]></item><item><![CDATA[b]]></item></|DSML|parameter>
+Number:  <|DSML|parameter name="count">42</|DSML|parameter>
+Boolean: <|DSML|parameter name="enabled">true</|DSML|parameter>
 
-Remember: The ONLY valid way to use tools is the <|DSML|tool_calls>...</|DSML|tool_calls> block at the end of your response. When calling tools, output ONLY the tool call block — no natural language before or after.
+## TOOL USAGE
+
+- **Create new files** → use Write or write_file tool
+- **Edit existing files** → use apply_patch tool with unified diff
+- **Read files** → use Read or read_file tool
+- **Run commands** → use Bash tool
+- **Search code** → use Grep or search_files tool
 """
 
 
@@ -267,6 +236,17 @@ def _example_params(name: str) -> str | None:
             f'  <|DSML|invoke name="{name}">\n'
             f'    <|DSML|parameter name="file_path"><![CDATA[notes.txt]]></|DSML|parameter>\n'
             f'    <|DSML|parameter name="content"><![CDATA[Hello world]]></|DSML|parameter>\n'
+            f'  </|DSML|invoke>',
+        ("apply_patch",):
+            f'  <|DSML|invoke name="{name}">\n'
+            f'    <|DSML|parameter name="patch"><![CDATA['
+            f'--- a/README.md\n'
+            f'+++ b/README.md\n'
+            f'@@ -1,3 +1,3 @@\n'
+            f' old line\n'
+            f'-removed\n'
+            f'+added\n'
+            f']]></|DSML|parameter>\n'
             f'  </|DSML|invoke>',
         ("Edit",):
             f'  <|DSML|invoke name="{name}">\n'
@@ -341,6 +321,10 @@ _TOOL_USAGE_NOTES: dict[str, str] = {
         "You MUST immediately proceed to execute step 1 via another tool call in the SAME response. "
         "Do NOT restate, summarize, or describe the plan in natural language. "
         "Do NOT ask the user to confirm before proceeding."
+    ),
+    "apply_patch": (
+        "Use apply_patch to edit existing files. Provide unified diff format in the 'patch' parameter. "
+        "Do NOT use sed, awk, or Bash commands to edit files."
     ),
 }
 
@@ -619,6 +603,9 @@ def _parse_child_parameters(parent: ET.Element, result: dict) -> None:
     for elem in list(parent):
         tag = elem.tag.lower()
         if tag not in ("parameter", "item"):
+            # 非标准标签(如 <step>,<status>):当作 key-value 对,不丢弃
+            name = elem.attrib.get("name", "").strip() or tag
+            result[name] = _xml_node_to_value(elem)
             continue
         name = elem.attrib.get("name", "").strip()
         if not name and tag == "item":
