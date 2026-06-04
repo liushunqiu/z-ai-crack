@@ -1,10 +1,11 @@
 """ChatRuntimeService: 请求 -> Z.ai API -> 事件流。
 
 负责：
-1. 会话管理 (session_id -> ChatSession 映射)
-2. 调用 zaibot_core 发送请求
-3. 解析 Z.ai SSE 流
-4. 产出 InternalStreamEvent 流
+1. 会话管理 (session_id -> ChatSession 映射, per-account)
+2. 通过 AccountManager 解析 session_id 对应的 Z.ai 账号
+3. 调用 zaibot_core 发送请求 (使用该账号的 token + cookie)
+4. 解析 Z.ai SSE 流
+5. 产出 InternalStreamEvent 流
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import AsyncIterator
+from pathlib import Path
+from typing import AsyncIterator, Optional
 
 from .models import (
     InternalRequest,
@@ -38,55 +40,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "zaibot")
 import zaibot_core
 from captcha_service import CaptchaSession
 
-# 全局 CaptchaSession 实例（持久浏览器，避免每次启动新浏览器）
-_captcha_session: CaptchaSession | None = None
-_session_lock = threading.Lock()
-
-
-def _get_captcha_session() -> CaptchaSession:
-    """获取或创建全局 CaptchaSession（线程安全）。"""
-    global _captcha_session
-    if _captcha_session is None:
-        with _session_lock:
-            if _captcha_session is None:
-                _captcha_session = CaptchaSession(headless=True)
-                _captcha_session.start()
-    return _captcha_session
-
-
-def _get_fresh_captcha(max_retries: int = 2) -> str | None:
-    """获取新的 captcha token（每次调用都获取新 token，因为 captcha 是一次性的）。"""
-    global _captcha_session
-    for attempt in range(max_retries + 1):
-        try:
-            sess = _get_captcha_session()
-            token = sess.get_captcha()
-            return token
-        except Exception as e:
-            print(f"[!] 获取 captcha 失败 (attempt {attempt + 1}/{max_retries + 1}): {e}", file=sys.stderr)
-            if attempt < max_retries:
-                with _session_lock:
-                    try:
-                        _captcha_session.close()
-                    except Exception:
-                        pass
-                    _captcha_session = None
-    return None
-
 
 class ChatRuntimeService:
     """管理会话并执行请求。
 
-    使用 TTLCache 管理会话：
-    - 最多 256 个并发会话（LRU 淘汰）
-    - 30 分钟未活跃自动过期清理
-    - 后台定期 sweep 过期条目
+    - ChatSession 池: session_id -> ChatSession (per-conversation chat state)
+    - 通过 AccountManager 解析 session_id -> account_id (粘性绑定)
+    - 每个账号独立的 CaptchaSession 浏览器 (用于 captcha token)
+    - 实际的 chat API 请求通过 urllib + per-account token/cookie
     """
 
     SESSION_MAX_SIZE = 256
     SESSION_TTL_SECONDS = 1800.0
 
-    def __init__(self) -> None:
+    def __init__(self, account_manager) -> None:
+        self.account_manager = account_manager
         self._sessions: TTLCache[zaibot_core.ChatSession] = TTLCache(
             max_size=self.SESSION_MAX_SIZE,
             ttl_seconds=self.SESSION_TTL_SECONDS,
@@ -105,13 +73,23 @@ class ChatRuntimeService:
     async def execute(self, req: InternalRequest) -> AsyncIterator[InternalStreamEvent]:
         """执行请求并产出事件流。
 
-        使用 fetch_streaming() 实现真流式：SSE chunk 到达即解析并 yield，
-        而非等待完整响应。通过 Queue 桥接线程池和 async generator。
+        1. 通过 account_manager 解析 session_id 对应账号
+        2. 拿该账号的 CaptchaSession 获取 captcha token
+        3. 用该账号的 token + cookie 走 urllib 流式请求
+        4. 通过 Queue 桥接线程池和 async generator
         """
         session_id = req.conversation_id
         session = self._get_or_create_session(session_id, req.model)
         is_first = session.chat_id is None
         prompt = self._flatten_messages(req, is_first=is_first)
+
+        # 解析账号 (round-robin 绑定, sticky)
+        account = self.account_manager.resolve_account(session_id)
+        if account is None:
+            yield StreamError("没有可用的 Z.ai 账号,请先在 /admin 添加并登录")
+            return
+        account_id = account.id
+        state_path = Path(account.storage_path)
 
         event_queue: queue.Queue[InternalStreamEvent | None] = queue.Queue()
 
@@ -119,13 +97,14 @@ class ChatRuntimeService:
             """同步执行流式请求，将事件逐个放入队列。"""
             max_retries = 2
             last_error = None
+            request_succeeded = False
 
             for attempt in range(max_retries + 1):
                 tool_parser = ToolCallStreamParser()
                 try:
-                    print(f"[*] === 请求 attempt {attempt}/{max_retries} ===", file=sys.stderr)
+                    print(f"[*] === 请求 attempt {attempt}/{max_retries} (account={account.name}) ===", file=sys.stderr)
 
-                    token = zaibot_core.read_token()
+                    token = zaibot_core.read_token_from_state(state_path)
                     user_id = zaibot_core.get_user_id(token)
                     if not user_id:
                         event_queue.put(StreamError("无法从 JWT 解析 user_id"))
@@ -142,12 +121,13 @@ class ChatRuntimeService:
                         chat_id = session.chat_id
                         print(f"[*] 复用已有 chat_id: {chat_id}", file=sys.stderr)
                     else:
-                        chat_id = zaibot_core.create_chat(req.model)
+                        cookie_for_create = zaibot_core.load_cookie_header_from_state(state_path)
+                        chat_id = zaibot_core.create_chat_with_token(token, cookie_for_create, req.model)
                         session.chat_id = chat_id
                         print(f"[*] 创建新 chat_id: {chat_id}", file=sys.stderr)
 
                     parent_id = session.last_assistant_id
-                    captcha_verify_param = _get_fresh_captcha()
+                    captcha_verify_param = self._get_fresh_captcha_for_account(account_id)
 
                     body_dict, assistant_id = zaibot_core.build_body(
                         prompt, model=req.model, stream=True,
@@ -158,20 +138,20 @@ class ChatRuntimeService:
                     params = zaibot_core.build_query_params(
                         token, user_id, timestamp, request_id, signature_timestamp
                     )
-                    headers = zaibot_core.build_headers(token, signature)
+                    cookie = zaibot_core.load_cookie_header_from_state(state_path)
+                    headers = zaibot_core.build_headers_with_cookie(token, signature, cookie)
 
                     query_string = urllib.parse.urlencode(params)
                     path = f"/api/v2/chat/completions?{query_string}"
                     body = json.dumps(body_dict, ensure_ascii=False).encode("utf-8")
 
-                    print(f"[*] 发送流式请求到 Z.ai (chat_id={chat_id})...", file=sys.stderr)
+                    print(f"[*] 发送流式请求到 Z.ai (account={account.name}, chat_id={chat_id})...", file=sys.stderr)
 
                     full_url = f"https://chat.z.ai{path}"
                     http_req = urllib.request.Request(
                         full_url, data=body, headers=headers, method="POST"
                     )
 
-                    # --- urllib 流式请求：逐行读取 SSE ---
                     sse_event_count = 0
                     retriable_sse_error = False
 
@@ -233,6 +213,7 @@ class ChatRuntimeService:
                     for ev in tool_parser.flush():
                         event_queue.put(ev)
                     session.last_assistant_id = assistant_id
+                    request_succeeded = True
                     event_queue.put(None)
                     return
 
@@ -269,6 +250,9 @@ class ChatRuntimeService:
             event_queue.put(StreamError(f"请求失败，已重试 {max_retries} 次: {last_error}"))
             event_queue.put(None)
 
+            # 标记请求结果
+            self.account_manager.mark_request(account_id, success=request_succeeded)
+
         # 在线程池中执行（不阻塞事件循环）
         loop = asyncio.get_event_loop()
         loop.run_in_executor(None, do_request_sync)
@@ -284,6 +268,17 @@ class ChatRuntimeService:
         """拍平消息。首次请求发送系统提示+工具定义+历史，后续请求只发新增消息（含工具结果）。"""
         return flatten_to_prompt(req, first_turn=is_first)
 
+    def _get_fresh_captcha_for_account(self, account_id: int, max_retries: int = 2) -> str | None:
+        """获取指定账号的 captcha token (每次调用都获取新 token, 因为 captcha 是一次性的)。"""
+        for attempt in range(max_retries + 1):
+            try:
+                sess = self.account_manager.get_captcha_session(account_id)
+                token = sess.get_captcha()
+                return token
+            except Exception as e:
+                print(f"[!] 获取 captcha 失败 (account_id={account_id}, attempt {attempt + 1}/{max_retries + 1}): {e}", file=sys.stderr)
+        return None
+
     def close_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
 
@@ -294,3 +289,4 @@ class ChatRuntimeService:
     def session_stats(self):
         """返回会话缓存统计。"""
         return self._sessions.stats()
+

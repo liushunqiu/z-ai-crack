@@ -154,6 +154,22 @@ def _read_state_local_storage(name: str) -> str:
     return ""
 
 
+def _read_state_local_storage_from(name: str, state_path: Path) -> str:
+    """Variant of _read_state_local_storage that reads from an explicit state file."""
+    if not state_path.exists():
+        return ""
+    try:
+        state = json.loads(state_path.read_text())
+        for origin in state.get("origins", []):
+            if origin.get("origin") == "https://chat.z.ai":
+                for item in origin.get("localStorage", []):
+                    if item.get("name") == name:
+                        return item.get("value") or ""
+    except Exception:
+        return ""
+    return ""
+
+
 def read_token() -> str:
     # Prefer storage_state token: it is the browser truth and captcha/session
     # binding follows this token. Keep zaibot_token.txt synchronized.
@@ -189,6 +205,33 @@ def get_user_name(default: str = "") -> str:
     except Exception:
         return default
     return default
+
+
+def read_token_from_state(state_path: Path) -> str:
+    """Read JWT token from a specific state file (per-account support)."""
+    state_token = _read_state_local_storage_from("token", state_path).strip()
+    if state_token:
+        return state_token
+    if not state_path.exists():
+        raise ZaibotError(f"State file not found: {state_path}")
+    raise ZaibotError(f"No token in state file: {state_path}")
+
+
+def get_user_name_from_state(state_path: Path, default: str = "") -> str:
+    """Read display name from a specific state file (per-account support)."""
+    try:
+        raw = _read_state_local_storage_from("user", state_path) or _read_state_local_storage_from("USER", state_path)
+        if raw:
+            user = json.loads(raw)
+            return user.get("name") or default
+    except Exception:
+        return default
+    return default
+
+
+def get_user_id_from_state(state_path: Path) -> str:
+    """Convenience: read token from state and decode user_id."""
+    return get_user_id(read_token_from_state(state_path))
 
 
 def now_ms() -> str:
@@ -438,6 +481,45 @@ def load_cookie_header(domain_suffix: str = "chat.z.ai") -> str:
     return "; ".join(pairs)
 
 
+def load_cookie_header_from_state(state_path: Path, domain_suffix: str = "chat.z.ai") -> str:
+    """Build Cookie header from a specific state file (per-account support)."""
+    if not state_path.exists():
+        return ""
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        return ""
+    pairs = []
+    for c in state.get("cookies", []):
+        domain = str(c.get("domain", "")).lstrip(".")
+        if domain == domain_suffix or domain.endswith("." + domain_suffix):
+            name = c.get("name")
+            value = c.get("value")
+            if name is not None and value is not None:
+                pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def build_headers_with_cookie(token: str, signature: str, cookie: str) -> Dict[str, str]:
+    """Variant of build_headers that takes an explicit Cookie header (per-account support)."""
+    fe_version = FE_VERSION.removeprefix("prod-fe-") if FE_VERSION.startswith("prod-fe-") else FE_VERSION
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json",
+        "Accept-Language": "en-US",
+        "Origin": "https://chat.z.ai",
+        "Referer": "https://chat.z.ai/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "X-FE-Version": fe_version,
+        "X-Region": "overseas",
+        "X-Signature": signature,
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
 def build_headers(token: str, signature: str) -> Dict[str, str]:
     # Strip 'prod-fe-' prefix from version (API expects plain version like '1.1.38')
     fe_version = FE_VERSION.removeprefix("prod-fe-") if FE_VERSION.startswith("prod-fe-") else FE_VERSION
@@ -546,6 +628,44 @@ def create_chat(model: str = DEFAULT_MODEL) -> str:
         "Referer": "https://chat.z.ai/",
     }
     cookie = load_cookie_header("chat.z.ai")
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(
+        f"{API_BASE}/v1/chats/new",
+        data=json.dumps({"chat": chat, "bot_id": None}, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data.get("id") or chat_id
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise ZaibotHTTPError(e.code, body, f"{API_BASE}/v1/chats/new") from None
+
+
+def create_chat_with_token(token: str, cookie: str, model: str = DEFAULT_MODEL) -> str:
+    """Variant of create_chat that takes explicit token and cookie (per-account support)."""
+    chat_id = new_id()
+    chat = {
+        "id": chat_id,
+        "title": "New Chat",
+        "models": [model],
+        "params": {},
+        "history": {"messages": {}, "currentId": ""},
+        "messages": [],
+        "tags": [],
+        "timestamp": int(time.time()),
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Language": "en-US",
+        "Origin": "https://chat.z.ai",
+        "Referer": "https://chat.z.ai/",
+    }
     if cookie:
         headers["Cookie"] = cookie
     req = urllib.request.Request(

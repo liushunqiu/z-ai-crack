@@ -146,14 +146,28 @@ class CaptchaSession:
     greenlet "Cannot switch to a different thread" errors when called from
     FastAPI's thread pool executor.
 
+    Each instance is bound to a specific state file (storage_state.json) and
+    captcha cache file. Pass state_path/token_path to use a non-default
+    account; defaults to the legacy single-account files.
+
     Usage:
         with CaptchaSession(headless=True) as session:
             token1 = session.get_captcha()
             token2 = session.get_captcha()  # reuses browser, new tab
     """
 
-    def __init__(self, headless: bool = True):
+    def __init__(
+        self,
+        headless: bool = True,
+        *,
+        state_path: Path | None = None,
+        token_path: Path | None = None,
+        captcha_cache_path: Path | None = None,
+    ):
         self.headless = headless
+        self.state_path: Path = state_path or STATE_FILE
+        self.token_path: Path = token_path or (BASE_DIR / "zaibot_token.txt")
+        self.captcha_cache_path: Path = captcha_cache_path or CACHE_FILE
         self._browser_ctx = None
         self._browser = None
         self._context = None
@@ -197,16 +211,69 @@ class CaptchaSession:
     def _start_browser(self):
         from camoufox import Camoufox
 
-        if not STATE_FILE.exists():
-            raise RuntimeError(f"Login state not found: {STATE_FILE}. Run 'python login.py login' first.")
+        if not self.state_path.exists():
+            raise RuntimeError(
+                f"Login state not found: {self.state_path}. "
+                f"Add the account through the admin UI or run login.py."
+            )
 
-        state = json.loads(STATE_FILE.read_text())
-        print(f"[*] Launching persistent Camoufox (headless={self.headless})...", file=sys.stderr)
+        state = json.loads(self.state_path.read_text())
+        print(f"[*] Launching persistent Camoufox (headless={self.headless}, state={self.state_path})...", file=sys.stderr)
 
         self._browser_ctx = Camoufox(headless=self.headless, geoip=False)
         self._browser = self._browser_ctx.__enter__()
         self._context = self._browser.new_context(storage_state=state)
         print(f"[*] Persistent browser ready.", file=sys.stderr)
+
+    def interactive_login(self, *, on_progress=None) -> bool:
+        """Headful login flow: open chat.z.ai and wait for user to complete login.
+
+        Returns True on success (token captured in localStorage), False otherwise.
+        Calls on_progress(status: str) for UI feedback.
+
+        The browser stays open and persistent so subsequent captcha calls can
+        reuse it. Must be called after start().
+        """
+        if not self._context:
+            raise RuntimeError("Session not started. Call start() first.")
+
+        return self._run_on_worker(self._interactive_login_impl, on_progress)
+
+    def _interactive_login_impl(self, on_progress) -> bool:
+        page = self._context.new_page()
+        try:
+            if on_progress:
+                on_progress("opening_chat.z.ai")
+            page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
+
+            if on_progress:
+                on_progress("waiting_for_login")
+            # Poll localStorage.token for up to 5 minutes
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                token = page.evaluate("() => localStorage.getItem('token') || ''")
+                token = (token or "").strip().strip('"')
+                if token:
+                    # Verify user object is also set (login is complete)
+                    user = page.evaluate("() => localStorage.getItem('user') || ''")
+                    if user and user != "null":
+                        # Save state immediately so partial state isn't lost if user closes window
+                        storage = self._context.storage_state()
+                        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                        self.state_path.write_text(json.dumps(storage, ensure_ascii=False, indent=2), encoding="utf-8")
+                        if on_progress:
+                            on_progress("login_succeeded")
+                        return True
+                time.sleep(2)
+
+            if on_progress:
+                on_progress("login_timeout")
+            return False
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
 
     def get_captcha(self, save: bool = True) -> str:
         """Get a fresh captcha token. Runs on the dedicated worker thread."""
@@ -230,7 +297,7 @@ class CaptchaSession:
         raw, param_obj = _build_captcha_raw(certify_id, security_token)
 
         if save:
-            CACHE_FILE.write_text(
+            self.captcha_cache_path.write_text(
                 json.dumps(
                     {
                         "raw": raw,

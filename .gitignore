@@ -23,3 +23,6 @@ zaibot/captured_data_fields.json
 zaibot/captured_request.json
 zaibot/captcha_analysis_chrome.json
 zaibot/hmac_secret.json
+
+# Multi-account bridge data (contains per-account storage state with cookies)
+zaibot-bridge/data/

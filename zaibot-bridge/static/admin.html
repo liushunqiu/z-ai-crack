@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Z.ai Bridge — 账号管理</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+    margin: 0; padding: 24px;
+    background: #f5f7fa; color: #1a1a1a;
+  }
+  h1 { margin: 0 0 8px 0; font-size: 24px; }
+  h2 { margin: 24px 0 12px 0; font-size: 18px; border-bottom: 1px solid #e0e0e0; padding-bottom: 6px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: white; border-radius: 8px; padding: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 16px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; font-size: 13px; }
+  th { background: #fafafa; font-weight: 600; color: #555; }
+  tr:hover { background: #fafbfc; }
+  .status {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+  }
+  .status-pending_login { background: #fff3cd; color: #856404; }
+  .status-active { background: #d4edda; color: #155724; }
+  .status-error { background: #f8d7da; color: #721c24; }
+  .status-disabled { background: #e2e3e5; color: #6c757d; }
+  button {
+    padding: 6px 12px; border: 1px solid #d0d0d0; background: white;
+    border-radius: 4px; cursor: pointer; font-size: 13px; margin-right: 4px;
+  }
+  button:hover { background: #f0f0f0; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: #2563eb; color: white; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+  button.danger { background: #dc2626; color: white; border-color: #dc2626; }
+  button.danger:hover { background: #b91c1c; }
+  button.warn { background: #f59e0b; color: white; border-color: #f59e0b; }
+  input, select {
+    padding: 6px 10px; border: 1px solid #d0d0d0; border-radius: 4px;
+    font-size: 13px; margin-right: 8px;
+  }
+  .form-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .empty { color: #999; text-align: center; padding: 24px; font-size: 13px; }
+  .event-log { max-height: 320px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+  .event-row { padding: 4px 0; border-bottom: 1px dotted #eee; }
+  .ts { color: #888; }
+  .ev-login_success { color: #155724; }
+  .ev-login_failed, .ev-login_timeout, .ev-state_missing { color: #721c24; }
+  .ev-session_bound { color: #2563eb; }
+  .progress {
+    background: #fffbeb; border: 1px solid #fbbf24; border-radius: 4px;
+    padding: 8px 12px; margin: 8px 0; font-size: 13px;
+  }
+  .progress.done { background: #d1fae5; border-color: #10b981; }
+  .progress.error { background: #fee2e2; border-color: #ef4444; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .badge { background: #e0e7ff; color: #3730a3; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+  .muted { color: #888; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Z.ai Bridge — 账号管理</h1>
+<div class="sub">
+  多账号粘性绑定：同一 <code>session_id</code> 永远使用同一账号；新 <code>session_id</code> 自动 round-robin 分配到 active 账号。
+  API 文档：<a href="/docs" target="_blank">/docs</a> · 健康检查：<a href="/api/status" target="_blank">/api/status</a>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">账号列表</h2>
+  <div class="form-row">
+    <input type="text" id="new-acc-name" placeholder="账号名 (如 alice, bob)" style="min-width:200px">
+    <button class="primary" onclick="createAccount()">+ 添加账号</button>
+    <button onclick="refreshAll()">刷新</button>
+  </div>
+  <div id="account-progress"></div>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>名称</th><th>状态</th><th>用户</th><th>请求数</th><th>错误</th>
+        <th>最后使用</th><th>备注</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="account-tbody">
+      <tr><td colspan="9" class="empty">加载中...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">会话绑定</h2>
+  <div class="row">
+    <input type="text" id="lookup-sid" placeholder="输入 session_id 查询" style="min-width:300px">
+    <button onclick="lookupBinding()">查询</button>
+  </div>
+  <div id="binding-lookup" style="margin-top:12px"></div>
+  <table style="margin-top:12px">
+    <thead>
+      <tr><th>session_id</th><th>账号</th><th>状态</th><th>绑定时间</th><th>最后活跃</th><th>操作</th></tr>
+    </thead>
+    <tbody id="binding-tbody">
+      <tr><td colspan="6" class="empty">加载中...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">事件日志 (最近 50 条)</h2>
+  <div class="event-log" id="event-log">
+    <div class="empty">加载中...</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pollTimer = null;
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    headers: {"Content-Type": "application/json"},
+    ...opts,
+  });
+  if (!resp.ok) {
+    let detail = "";
+    try { detail = (await resp.json()).detail || ""; } catch {}
+    throw new Error(`HTTP ${resp.status}: ${detail || resp.statusText}`);
+  }
+  return resp.json();
+}
+
+function fmtTs(ts) {
+  if (!ts || ts < 1) return "-";
+  const d = new Date(ts * 1000);
+  return d.toLocaleString("zh-CN", {hour12: false});
+}
+
+function relTime(ts) {
+  if (!ts || ts < 1) return "-";
+  const diff = Date.now() / 1000 - ts;
+  if (diff < 60) return `${Math.floor(diff)}秒前`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前`;
+  return `${Math.floor(diff / 86400)}天前`;
+}
+
+async function loadAccounts() {
+  const data = await api("/admin/api/accounts");
+  const tbody = $("account-tbody");
+  if (!data.accounts.length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">还没有账号,请先添加</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.accounts.map(a => {
+    const buttons = [];
+    if (a.status === "pending_login" || a.status === "error") {
+      buttons.push(`<button class="primary" onclick="startLogin(${a.id})">登录</button>`);
+    }
+    if (a.status === "active") {
+      buttons.push(`<button class="warn" onclick="setStatus(${a.id}, 'disabled')">停用</button>`);
+    }
+    if (a.status === "disabled" || a.status === "error") {
+      buttons.push(`<button onclick="setStatus(${a.id}, 'active')">启用</button>`);
+    }
+    buttons.push(`<button class="danger" onclick="delAccount(${a.id}, '${a.name.replace(/'/g, "\\'")}')">删除</button>`);
+    return `<tr>
+      <td>${a.id}</td>
+      <td><strong>${a.name}</strong></td>
+      <td><span class="status status-${a.status}">${a.status}</span></td>
+      <td>${a.user_name || "-"} <span class="muted">${a.user_id ? `(${a.user_id.slice(0, 8)}...)` : ""}</span></td>
+      <td>${a.request_count}</td>
+      <td>${a.error_count}</td>
+      <td><span class="muted" title="${fmtTs(a.last_used_at)}">${relTime(a.last_used_at)}</span></td>
+      <td><span class="muted">${a.note || ""}</span></td>
+      <td>${buttons.join(" ")}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadBindings() {
+  const data = await api("/admin/api/bindings");
+  const tbody = $("binding-tbody");
+  if (!data.bindings.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">暂无绑定 (新 session_id 到来时自动分配)</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.bindings.map(b => `
+    <tr>
+      <td><code>${b.session_id}</code></td>
+      <td>${b.account_name} <span class="muted">#${b.account_id}</span></td>
+      <td><span class="status status-${b.account_status}">${b.account_status}</span></td>
+      <td><span class="muted" title="${fmtTs(b.bound_at)}">${relTime(b.bound_at)}</span></td>
+      <td><span class="muted" title="${fmtTs(b.last_active)}">${relTime(b.last_active)}</span></td>
+      <td>
+        <select id="rebind-${b.session_id}">
+          ${[...new Set([b.account_id, ...window.__allAccountIds || []])].map(id => {
+            const a = (window.__accountMap || {})[id];
+            return `<option value="${id}" ${id === b.account_id ? "selected" : ""}>${a ? a.name : "#" + id}</option>`;
+          }).join("")}
+        </select>
+        <button onclick="rebind('${b.session_id}')">改绑</button>
+        <button class="danger" onclick="unbind('${b.session_id}')">解绑</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+async function loadEvents() {
+  const data = await api("/admin/api/events?limit=50");
+  const log = $("event-log");
+  if (!data.events.length) {
+    log.innerHTML = `<div class="empty">暂无事件</div>`;
+    return;
+  }
+  log.innerHTML = data.events.map(e => `
+    <div class="event-row ev-${e.event_type}">
+      <span class="ts">${fmtTs(e.created_at)}</span>
+      <span class="badge">${e.event_type}</span>
+      ${e.account_name ? `<strong>${e.account_name}</strong>` : ""}
+      ${e.session_id ? `<code>${e.session_id.slice(0, 16)}${e.session_id.length > 16 ? "..." : ""}</code>` : ""}
+      ${e.detail ? `<span class="muted">— ${e.detail.slice(0, 100)}</span>` : ""}
+    </div>
+  `).join("");
+}
+
+async function refreshAll() {
+  try {
+    const accData = await api("/admin/api/accounts");
+    window.__allAccountIds = accData.accounts.map(a => a.id);
+    window.__accountMap = Object.fromEntries(accData.accounts.map(a => [a.id, a]));
+    await Promise.all([loadAccounts(), loadBindings(), loadEvents()]);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function createAccount() {
+  const name = $("new-acc-name").value.trim();
+  if (!name) { alert("账号名必填"); return; }
+  try {
+    await api("/admin/api/accounts", {method: "POST", body: JSON.stringify({name})});
+    $("new-acc-name").value = "";
+    refreshAll();
+  } catch (e) {
+    alert("添加失败: " + e.message);
+  }
+}
+
+async function startLogin(accountId) {
+  const progressDiv = $("account-progress");
+  progressDiv.innerHTML = `<div class="progress">启动登录流程 (account #${accountId}),请在弹出的浏览器窗口中完成登录...<br>可能需要 30s - 5min,期间此账号暂停服务</div>`;
+  try {
+    const resp = await fetch(`/admin/api/accounts/${accountId}/login`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "Accept": "text/event-stream"},
+      body: JSON.stringify({}),
+    });
+    if (!resp.body) {
+      const result = await resp.json();
+      progressDiv.innerHTML = `<div class="progress ${result.ok ? 'done' : 'error'}">${result.ok ? '✓ 登录成功' : '✗ 登录失败'}</div>`;
+      refreshAll();
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const obj = JSON.parse(line.slice(6));
+          if (obj.progress === "done") {
+            progressDiv.innerHTML = `<div class="progress ${obj.ok ? 'done' : 'error'}">${obj.ok ? '✓ 登录成功' : '✗ 登录失败'}</div>`;
+            refreshAll();
+          } else if (obj.progress === "error") {
+            progressDiv.innerHTML = `<div class="progress error">✗ 错误: ${obj.message}</div>`;
+          } else {
+            progressDiv.innerHTML = `<div class="progress">${obj.progress} ...</div>`;
+          }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    progressDiv.innerHTML = `<div class="progress error">✗ 异常: ${e.message}</div>`;
+  }
+  setTimeout(() => { progressDiv.innerHTML = ""; refreshAll(); }, 3000);
+}
+
+async function setStatus(accountId, status) {
+  try {
+    await api(`/admin/api/accounts/${accountId}`, {method: "PATCH", body: JSON.stringify({status})});
+    refreshAll();
+  } catch (e) { alert(e.message); }
+}
+
+async function delAccount(accountId, name) {
+  if (!confirm(`确认删除账号 "${name}" 及其所有会话绑定?`)) return;
+  try {
+    await api(`/admin/api/accounts/${accountId}`, {method: "DELETE"});
+    refreshAll();
+  } catch (e) { alert(e.message); }
+}
+
+async function rebind(sessionId) {
+  const sel = $(`rebind-${sessionId}`);
+  const accountId = parseInt(sel.value, 10);
+  try {
+    await api(`/admin/api/bindings/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH", body: JSON.stringify({account_id: accountId})
+    });
+    refreshAll();
+  } catch (e) { alert(e.message); }
+}
+
+async function unbind(sessionId) {
+  if (!confirm(`解绑 session_id ${sessionId}?`)) return;
+  try {
+    await api(`/admin/api/bindings/${encodeURIComponent(sessionId)}`, {method: "DELETE"});
+    refreshAll();
+  } catch (e) { alert(e.message); }
+}
+
+async function lookupBinding() {
+  const sid = $("lookup-sid").value.trim();
+  if (!sid) return;
+  const target = $("binding-lookup");
+  try {
+    const info = await api(`/admin/api/bindings/${encodeURIComponent(sid)}`);
+    target.innerHTML = `<div class="card" style="margin:0;background:#f0f9ff">
+      <code>${sid}</code> → <strong>${info.account_name}</strong>
+      <span class="status status-${info.account_status}">${info.account_status}</span>
+      <br><span class="muted">绑定于 ${fmtTs(info.bound_at)}, 最后活跃 ${relTime(info.last_active)}</span>
+    </div>`;
+  } catch (e) {
+    // 404 时尝试 resolve
+    try {
+      const r = await api(`/admin/api/resolve?session_id=${encodeURIComponent(sid)}`);
+      if (r.bound) {
+        target.innerHTML = `<div class="card" style="margin:0;background:#f0f9ff">已绑定: ${r.info.account_name}</div>`;
+      } else {
+        target.innerHTML = `<div class="card" style="margin:0;background:#fffbeb">
+          未绑定。新请求到来时将自动分配: ${r.active_names.length ? r.active_names.join(", ") : "无 active 账号"}
+        </div>`;
+      }
+    } catch (e2) {
+      target.innerHTML = `<div class="card" style="margin:0;background:#fee2e2">${e.message}</div>`;
+    }
+  }
+}
+
+// 启动 + 定时刷新
+refreshAll();
+pollTimer = setInterval(refreshAll, 5000);
+window.addEventListener("beforeunload", () => clearInterval(pollTimer));
+</script>
+</body>
+</html>
