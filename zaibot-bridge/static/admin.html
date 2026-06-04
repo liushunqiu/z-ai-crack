@@ -162,6 +162,9 @@ async function loadAccounts() {
     if (a.status === "pending_login" || a.status === "error") {
       buttons.push(`<button class="primary" onclick="startLogin(${a.id})">登录</button>`);
     }
+    if (a.status !== "active") {
+      buttons.push(`<button onclick="testAccount(${a.id})">测试</button>`);
+    }
     if (a.status === "active") {
       buttons.push(`<button class="warn" onclick="setStatus(${a.id}, 'disabled')">停用</button>`);
     }
@@ -302,6 +305,20 @@ async function setStatus(accountId, status) {
     await api(`/admin/api/accounts/${accountId}`, {method: "PATCH", body: JSON.stringify({status})});
     refreshAll();
   } catch (e) { alert(e.message); }
+}
+
+async function testAccount(accountId) {
+  const progressDiv = $("account-progress");
+  progressDiv.innerHTML = `<div class="progress">测试中 (account #${accountId})...</div>`;
+  try {
+    const result = await api(`/admin/api/accounts/${accountId}/test`, {method: "POST", body: JSON.stringify({})});
+    progressDiv.innerHTML = `<div class="progress done">${result.message}</div>`;
+    refreshAll();
+    setTimeout(() => { progressDiv.innerHTML = ""; }, 5000);
+  } catch (e) {
+    progressDiv.innerHTML = `<div class="progress error">✗ ${e.message}</div>`;
+    setTimeout(() => { progressDiv.innerHTML = ""; refreshAll(); }, 8000);
+  }
 }
 
 async function delAccount(accountId, name) {

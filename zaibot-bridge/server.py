@@ -316,16 +316,6 @@ async def admin_start_login(account_id: int, request: Request):
     async def event_stream():
         import asyncio as _aio
         loop = _aio.get_event_loop()
-        result_holder: dict = {}
-
-        def progress(msg: str):
-            loop.call_soon_threadsafe(_push, msg)
-
-        def _push(msg: str):
-            # 放入队列, 等待 stream 读取
-            pass  # 实际推送在下面处理
-
-        # 用 Queue 桥接
         q: _aio.Queue = _aio.Queue()
 
         def progress_q(msg: str):
@@ -334,21 +324,21 @@ async def admin_start_login(account_id: int, request: Request):
         def task():
             try:
                 ok = account_manager.start_interactive_login(account_id, on_progress=progress_q)
-                loop.call_soon_threadsafe(q.put_nowait, ("__DONE__", ok))
+                loop.call_soon_threadsafe(q.put_nowait, {"__done__": True, "ok": ok})
             except Exception as e:
-                loop.call_soon_threadsafe(q.put_nowait, ("__ERROR__", str(e)))
+                loop.call_soon_threadsafe(q.put_nowait, {"__error__": True, "message": str(e)})
 
         threading.Thread(target=task, daemon=True).start()
 
         while True:
             item = await q.get()
-            if isinstance(item, tuple) and item[0] == "__DONE__":
-                yield f"data: {{'progress': 'done', 'ok': {str(item[1]).lower()}}}\n\n"
+            if isinstance(item, dict) and item.get("__done__"):
+                yield f"data: {json.dumps({'progress': 'done', 'ok': item['ok']}, ensure_ascii=False)}\n\n"
                 break
-            if isinstance(item, tuple) and item[0] == "__ERROR__":
-                yield f"data: {{'progress': 'error', 'message': {json.dumps(item[1])}}}\n\n"
+            if isinstance(item, dict) and item.get("__error__"):
+                yield f"data: {json.dumps({'progress': 'error', 'message': item['message']}, ensure_ascii=False)}\n\n"
                 break
-            yield f"data: {{'progress': {json.dumps(item)}}}\n\n"
+            yield f"data: {json.dumps({'progress': item}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -371,6 +361,24 @@ async def admin_delete_account(account_id: int):
     if not ok:
         raise HTTPException(404, "账号不存在")
     return {"ok": True}
+
+
+@app.post("/admin/api/accounts/{account_id}/test")
+async def admin_test_account(account_id: int):
+    """端到端测试: state + captcha + API。通过则自动 mark active。
+
+    阻塞调用, 通常 5-15 秒。
+    """
+    if not account_manager:
+        raise HTTPException(503, "AccountManager not initialized")
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None, lambda: account_manager.test_account(account_id)
+    )
+    if not result["ok"]:
+        raise HTTPException(400, result.get("message", "test failed"))
+    return result
 
 
 @app.patch("/admin/api/accounts/{account_id}")

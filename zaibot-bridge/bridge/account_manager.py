@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -47,13 +48,22 @@ class AccountManager:
         return d
 
     def _startup_init(self) -> None:
-        """启动时检查所有 active 账号,如果 state 文件还在就保持 active。"""
+        """启动时检查所有账号:
+        - active 账号: state 文件丢失 → 标 error
+        - pending_login 账号: state 文件存在且 token 有效 → 自动激活
+        """
         for acc in self.db.list_accounts():
+            state = Path(acc.storage_path)
             if acc.status == "active":
-                state = Path(acc.storage_path)
                 if not state.exists():
                     self.db.update_account(acc.id, status="error", note=f"state 文件丢失: {state}")
                     self.db.record_event("state_missing", account_id=acc.id, detail=str(state))
+            elif acc.status == "pending_login":
+                if state.exists():
+                    # 尝试自动激活
+                    result = self._try_activate_from_state(acc.id)
+                    if result:
+                        print(f"[account-manager] auto-activated account {acc.name}: {result}", file=sys.stderr)
 
     # ---------- 账号管理 (admin API) ----------
 
@@ -156,7 +166,16 @@ class AccountManager:
         """为指定账号启动交互式登录流程 (headful 浏览器)。
 
         完成后保存 state 并将账号标记为 active。返回是否登录成功。
+
+        检测策略 (借鉴 zaibot/login.py 的成熟做法):
+        1. 导航到 chat.z.ai/auth, 让用户看到登录表单
+        2. 轮询 localStorage.token (用 .strip() 处理可能的引号)
+        3. 拿到 token 立即调 /api/v1/auths/ 验证 role (不是 guest 才是真用户)
+        4. 验证通过立即保存 state + 标记 active
         """
+        import json as _json
+        import base64 as _b64
+
         acc = self.db.get_account(account_id)
         if not acc:
             raise ValueError(f"账号不存在: {account_id}")
@@ -166,13 +185,6 @@ class AccountManager:
         # 先关闭该账号已有的浏览器
         self._close_session(account_id)
 
-        # 启动新的 headful CaptchaSession 做登录
-        login_session = CaptchaSession(
-            headless=False,
-            state_path=state_path,
-        )
-        # 跳过 state 加载 (state 可能不存在或已失效)
-        # 我们手动 start 然后用 _context 直接 goto
         try:
             from camoufox import Camoufox
             with Camoufox(headless=False, geoip=False) as browser:
@@ -180,54 +192,96 @@ class AccountManager:
                 page = context.new_page()
                 try:
                     if on_progress:
-                        on_progress("opening_chat.z.ai")
-                    page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
+                        on_progress("opening_login_page")
+                    # 跟 zaibot/login.py 一样, 用 auth 页面
+                    page.goto("https://chat.z.ai/auth", wait_until="networkidle", timeout=60000)
+
                     if on_progress:
                         on_progress("waiting_for_login")
-                    deadline = time.time() + 300
+
+                    deadline = time.time() + 600  # 10 分钟
                     while time.time() < deadline:
-                        token = page.evaluate("() => localStorage.getItem('token') || ''")
-                        token = (token or "").strip().strip('"')
-                        if token:
-                            user_raw = page.evaluate("() => localStorage.getItem('user') || ''")
-                            if user_raw and user_raw != "null":
-                                storage = context.storage_state()
-                                state_path.write_text(
-                                    __import__("json").dumps(storage, ensure_ascii=False, indent=2),
-                                    encoding="utf-8",
+                        # 用与 login.py 一致的简单取法
+                        try:
+                            token = page.evaluate("localStorage.getItem('token')")
+                        except Exception:
+                            # 页面可能在跳转, 重新导航
+                            try:
+                                page.goto("https://chat.z.ai/auth", wait_until="domcontentloaded", timeout=30000)
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                            continue
+                        if token and token.strip():
+                            token = token.strip()
+                            # 调 API 验证是否为真实用户 (排除游客)
+                            try:
+                                req = urllib.request.Request(
+                                    "https://chat.z.ai/api/v1/auths/",
+                                    headers={
+                                        "Authorization": f"Bearer {token}",
+                                        "Accept": "application/json",
+                                    },
                                 )
-                                user_id = ""
-                                user_name = ""
-                                try:
-                                    parts = token.split(".")
-                                    payload = __import__("json").loads(
-                                        __import__("base64").urlsafe_b64decode(
-                                            parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
-                                        )
+                                with urllib.request.urlopen(req, timeout=10) as resp:
+                                    auth_info = _json.loads(resp.read())
+                                role = auth_info.get("role")
+                            except Exception:
+                                # API 暂时不通, 再等等
+                                time.sleep(2)
+                                continue
+
+                            if not role or role == "guest":
+                                # 游客模式, 继续等
+                                time.sleep(2)
+                                continue
+
+                            # 真实用户! 解析 user_id + 获取 user_name
+                            user_id = ""
+                            try:
+                                parts = token.split(".")
+                                if len(parts) >= 2:
+                                    payload = _json.loads(
+                                        _b64.urlsafe_b64decode(parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4))
                                     )
                                     user_id = payload.get("id", "")
-                                    user = __import__("json").loads(user_raw)
-                                    user_name = user.get("name", "")
-                                except Exception:
-                                    pass
-                                self.db.update_account(
-                                    account_id,
-                                    status="active",
-                                    user_id=user_id,
-                                    user_name=user_name,
-                                    last_login_at=time.time(),
+                            except Exception:
+                                pass
+                            user_name = auth_info.get("name", "") or auth_info.get("email", "")
+
+                            # 保存 state (先于 DB 更新, 失败可重试)
+                            try:
+                                storage = context.storage_state()
+                                state_path.write_text(
+                                    _json.dumps(storage, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
                                 )
+                            except Exception as e:
                                 if on_progress:
-                                    on_progress("login_succeeded")
-                                self.db.record_event(
-                                    "login_success", account_id=account_id,
-                                    detail=f"user_id={user_id}, user_name={user_name}",
-                                )
-                                return True
+                                    on_progress(f"save_error: {e}")
+                                time.sleep(2)
+                                continue
+
+                            # 标记 active
+                            self.db.update_account(
+                                account_id,
+                                status="active",
+                                user_id=user_id,
+                                user_name=user_name,
+                                last_login_at=time.time(),
+                            )
+                            if on_progress:
+                                on_progress("login_succeeded")
+                            self.db.record_event(
+                                "login_success", account_id=account_id,
+                                detail=f"user_id={user_id}, user_name={user_name}, role={role}",
+                            )
+                            return True
                         time.sleep(2)
+
                     if on_progress:
                         on_progress("login_timeout")
-                    self.db.update_account(account_id, status="error", note="登录超时")
+                    self.db.update_account(account_id, status="error", note="登录超时 (10 分钟)")
                     self.db.record_event("login_timeout", account_id=account_id)
                     return False
                 finally:
@@ -241,6 +295,172 @@ class AccountManager:
             if on_progress:
                 on_progress(f"login_error: {e}")
             return False
+
+    def test_account(self, account_id: int, *, on_progress=None) -> dict:
+        """端到端测试: 验证 state 文件 + 拿 captcha + 调一次 API。
+
+        全部通过 → 自动标记 active (因为已经证明账号可用)
+        任何步骤失败 → 返回详细错误信息, 状态保持不变
+
+        Args:
+            on_progress: 可选回调, 用于推送进度 ("checking_state" / "fetching_captcha" / "calling_api")
+        """
+        import json as _json
+
+        acc = self.db.get_account(account_id)
+        if not acc:
+            return {"ok": False, "message": f"账号不存在: {account_id}"}
+        state_path = Path(acc.storage_path)
+        if not state_path.exists():
+            return {"ok": False, "message": f"state 文件不存在: {state_path}, 请先登录"}
+
+        # Step 1: 检查 state + token
+        if on_progress:
+            on_progress("checking_state")
+        result = self._check_state_valid(state_path)
+        if not result["ok"]:
+            return result
+        user_id = result["user_id"]
+        user_name = result["user_name"]
+        role = result["role"]
+
+        # Step 2: 拿 captcha (测试浏览器)
+        if on_progress:
+            on_progress("fetching_captcha")
+        try:
+            captcha_sess = CaptchaSession(headless=True, state_path=state_path)
+            captcha_sess.start()
+        except Exception as e:
+            return {"ok": False, "message": f"启动 captcha 浏览器失败: {e}"}
+
+        try:
+            captcha = captcha_sess.get_captcha()
+        except Exception as e:
+            captcha_sess.close()
+            return {"ok": False, "message": f"获取 captcha 失败: {e}"}
+        if not captcha:
+            captcha_sess.close()
+            return {"ok": False, "message": "captcha token 为空"}
+
+        # Step 3: 调一次最小 API (创建 chat), 验证整条链路
+        if on_progress:
+            on_progress("calling_api")
+        try:
+            # 用 zaibot_core 的 helper
+            sys.path.insert(0, str(ZAIBOT_DIR))
+            import zaibot_core as _zc
+            cookie = _zc.load_cookie_header_from_state(state_path)
+            chat_id = _zc.create_chat_with_token(result["token"], cookie, "GLM-5.1")
+        except Exception as e:
+            captcha_sess.close()
+            return {"ok": False, "message": f"API 调用失败: {e}"}
+
+        captcha_sess.close()
+
+        # 全部通过, 标记 active
+        self.db.update_account(
+            account_id,
+            status="active",
+            user_id=user_id,
+            user_name=user_name,
+            last_login_at=time.time(),
+        )
+        self.db.record_event(
+            "test_success", account_id=account_id,
+            detail=f"user_name={user_name}, role={role}, chat_id={chat_id[:8]}...",
+        )
+        return {
+            "ok": True,
+            "message": f"✓ 测试通过: {user_name} (role={role})",
+            "user_id": user_id,
+            "user_name": user_name,
+            "role": role,
+            "chat_id": chat_id,
+        }
+
+    def _try_activate_from_state(self, account_id: int) -> str | None:
+        """尝试从 state 文件自动激活账号 (启动时调用)。仅检查 token 有效性, 不跑 captcha。"""
+        acc = self.db.get_account(account_id)
+        if not acc:
+            return None
+        state_path = Path(acc.storage_path)
+        if not state_path.exists():
+            return None
+        result = self._check_state_valid(state_path)
+        if not result["ok"]:
+            return None
+        self.db.update_account(
+            account_id,
+            status="active",
+            user_id=result["user_id"],
+            user_name=result["user_name"],
+            last_login_at=time.time(),
+        )
+        self.db.record_event(
+            "auto_activate", account_id=account_id,
+            detail=f"user_name={result['user_name']}, role={result['role']}",
+        )
+        return f"auto-activated: {result['user_name']} (role={result['role']})"
+
+    @staticmethod
+    def _check_state_valid(state_path: Path) -> dict:
+        """检查 state 文件中的 token 是否有效 (调 /api/v1/auths/ 验证)。"""
+        import json as _json
+        import base64 as _b64
+        import urllib.request as _ur
+
+        try:
+            state = _json.loads(state_path.read_text())
+        except Exception as e:
+            return {"ok": False, "message": f"state 文件解析失败: {e}"}
+
+        token = ""
+        for origin in state.get("origins", []):
+            if origin.get("origin") == "https://chat.z.ai":
+                for item in origin.get("localStorage", []):
+                    if item.get("name") == "token":
+                        token = (item.get("value") or "").strip().strip('"')
+                        break
+                if token:
+                    break
+        if not token:
+            return {"ok": False, "message": "state 文件中没有 token"}
+
+        user_id = ""
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload = _json.loads(
+                    _b64.urlsafe_b64decode(parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4))
+                )
+                user_id = payload.get("id", "")
+        except Exception:
+            pass
+
+        try:
+            req = _ur.Request(
+                "https://chat.z.ai/api/v1/auths/",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+            with _ur.urlopen(req, timeout=10) as resp:
+                auth_info = _json.loads(resp.read())
+        except Exception as e:
+            return {"ok": False, "message": f"API 验证失败: {e}"}
+
+        role = auth_info.get("role")
+        if role == "guest":
+            return {"ok": False, "message": "当前是游客模式, 请重新登录"}
+        if role is None:
+            return {"ok": False, "message": f"无法识别 role: {auth_info}"}
+
+        user_name = auth_info.get("name", "") or auth_info.get("email", "")
+        return {
+            "ok": True,
+            "token": token,
+            "user_id": user_id,
+            "user_name": user_name,
+            "role": role,
+        }
 
     # ---------- 请求执行时的查找 ----------
 
