@@ -162,7 +162,8 @@ async function loadAccounts() {
     if (a.status === "pending_login" || a.status === "error") {
       buttons.push(`<button class="primary" onclick="startLogin(${a.id})">登录</button>`);
     }
-    if (a.status !== "active") {
+    // 只有 state 文件存在时才显示「测试」(否则点了也是 400)
+    if (a.status !== "active" && a.has_state_file) {
       buttons.push(`<button onclick="testAccount(${a.id})">测试</button>`);
     }
     if (a.status === "active") {
@@ -175,7 +176,7 @@ async function loadAccounts() {
     return `<tr>
       <td>${a.id}</td>
       <td><strong>${a.name}</strong></td>
-      <td><span class="status status-${a.status}">${a.status}</span></td>
+      <td><span class="status status-${a.status}">${a.status} ${a.has_state_file ? '' : '<span class="muted" title="无 state 文件">⚠</span>'}</span></td>
       <td>${a.user_name || "-"} <span class="muted">${a.user_id ? `(${a.user_id.slice(0, 8)}...)` : ""}</span></td>
       <td>${a.request_count}</td>
       <td>${a.error_count}</td>

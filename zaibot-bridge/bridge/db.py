@@ -295,6 +295,8 @@ class AccountDB:
 
 def account_to_public_dict(acc: Account) -> dict:
     """账号信息转字典 (供 API 返回)。"""
+    from pathlib import Path
+    has_state = Path(acc.storage_path).exists()
     return {
         "id": acc.id,
         "name": acc.name,
@@ -306,6 +308,7 @@ def account_to_public_dict(acc: Account) -> dict:
         "last_login_at": acc.last_login_at,
         "request_count": acc.request_count,
         "error_count": acc.error_count,
+        "has_state_file": has_state,
         "created_at": acc.created_at,
         "updated_at": acc.updated_at,
     }
