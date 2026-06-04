@@ -68,7 +68,12 @@ class AccountManager:
     # ---------- 账号管理 (admin API) ----------
 
     def list_accounts(self) -> list[dict]:
-        return [account_to_public_dict(a) for a in self.db.list_accounts()]
+        out = []
+        for a in self.db.list_accounts():
+            d = account_to_public_dict(a)
+            d["recent_stats"] = self.db.count_recent_request_stats(a.id)
+            out.append(d)
+        return out
 
     def create_account(self, name: str) -> dict:
         """创建新账号,返回账号信息和 storage 路径。"""
@@ -549,12 +554,33 @@ class AccountManager:
         with self._session_lock:
             return {aid: "running" for aid in self._sessions.keys()}
 
-    def mark_request(self, account_id: int, *, success: bool) -> None:
+    def mark_request(
+        self,
+        account_id: int,
+        *,
+        success: bool,
+        kind: Optional[str] = None,
+    ) -> None:
+        """记录一次请求结果。
+
+        Args:
+            success: True=成功, False=失败
+            kind: 失败时的错误 kind (来自 zaibot_core.classify_error),
+                  仅在 success=False 时生效, 写入对应细分列。
+        """
         delta = 1 if success else 0
         err_delta = 0 if success else 1
-        self.db.update_account(
-            account_id,
+        kwargs = dict(
             last_used_at=time.time(),
             request_count_delta=delta,
             error_count_delta=err_delta,
+        )
+        if not success and kind:
+            kwargs["error_kind_delta"] = (kind, 1)
+        self.db.update_account(account_id, **kwargs)
+        # 写入 events, 用于近 1h/24h 统计
+        self.db.record_event(
+            "request_success" if success else "request_error",
+            account_id=account_id,
+            detail=kind or "",
         )

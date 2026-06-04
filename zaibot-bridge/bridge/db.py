@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_login_at   REAL    DEFAULT 0,
     request_count   INTEGER DEFAULT 0,
     error_count     INTEGER DEFAULT 0,
+    err_token_count     INTEGER DEFAULT 0,
+    err_captcha_count   INTEGER DEFAULT 0,
+    err_signature_count INTEGER DEFAULT 0,
+    err_rate_limit_count INTEGER DEFAULT 0,
+    err_server_count    INTEGER DEFAULT 0,
+    err_unknown_count   INTEGER DEFAULT 0,
     created_at      REAL    NOT NULL,
     updated_at      REAL    NOT NULL
 );
@@ -55,10 +61,44 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_account ON events(account_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(event_type, created_at);
 """
 
 
+# 现有 DB 升级时补充的列 (idempotent, 失败即忽略)
+_ACCOUNT_MIGRATIONS = [
+    "ALTER TABLE accounts ADD COLUMN err_token_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN err_captcha_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN err_signature_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN err_rate_limit_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN err_server_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN err_unknown_count INTEGER DEFAULT 0",
+]
+
+# 错误 kind -> 计数列名
+ERROR_KIND_COLUMNS = {
+    "token/login 失效":        "err_token_count",
+    "captcha_verify_param 失效或缺失": "err_captcha_count",
+    "X-Signature 失效或签名参数不匹配": "err_signature_count",
+    "限流":                  "err_rate_limit_count",
+    "服务端错误":              "err_server_count",
+    "未知错误":                "err_unknown_count",
+}
+
+
 ACCOUNT_STATUSES = {"pending_login", "active", "error", "disabled"}
+
+
+# 错误 kind 归一化 (未知类型归到 err_unknown_count)
+def _column_for_error_kind(kind: Optional[str]) -> str:
+    if not kind:
+        return "err_unknown_count"
+    for prefix, col in ERROR_KIND_COLUMNS.items():
+        if prefix == "未知错误":
+            continue
+        if kind == prefix or kind.startswith(prefix):
+            return col
+    return "err_unknown_count"
 
 
 @dataclass
@@ -76,10 +116,17 @@ class Account:
     error_count: int
     created_at: float
     updated_at: float
+    err_token_count: int = 0
+    err_captcha_count: int = 0
+    err_signature_count: int = 0
+    err_rate_limit_count: int = 0
+    err_server_count: int = 0
+    err_unknown_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Account":
-        return cls(**{k: row[k] for k in row.keys()})
+        known = {f for f in cls.__dataclass_fields__.keys()}
+        return cls(**{k: row[k] for k in row.keys() if k in known})
 
 
 @dataclass
@@ -110,6 +157,12 @@ class AccountDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # 兼容老库: 补齐新增列
+            for stmt in _ACCOUNT_MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
 
     def close(self) -> None:
         with self._lock:
@@ -168,6 +221,7 @@ class AccountDB:
         last_login_at: Optional[float] = None,
         request_count_delta: Optional[int] = None,
         error_count_delta: Optional[int] = None,
+        error_kind_delta: Optional[tuple[str, int]] = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -187,6 +241,10 @@ class AccountDB:
             sets.append("request_count=request_count+?"); vals.append(request_count_delta)
         if error_count_delta is not None:
             sets.append("error_count=error_count+?"); vals.append(error_count_delta)
+        if error_kind_delta is not None:
+            kind, delta = error_kind_delta
+            col = _column_for_error_kind(kind)
+            sets.append(f"{col}={col}+?"); vals.append(delta)
         if not sets:
             return
         sets.append("updated_at=?"); vals.append(time.time())
@@ -292,6 +350,42 @@ class AccountDB:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # ---------- 请求统计 (近 1h / 24h) ----------
+
+    def count_recent_request_stats(
+        self,
+        account_id: int,
+        *,
+        windows: tuple[int, ...] = (3600, 86400),
+    ) -> dict[str, dict[str, int]]:
+        """按时间窗口统计指定账号的请求成功/失败次数。
+
+        依赖 events 表里的 event_type IN ('request_success', 'request_error')。
+        返回结构: {"1h": {"ok": n, "err": m}, "24h": {...}}
+        """
+        now = time.time()
+        result: dict[str, dict[str, int]] = {}
+        with self._lock:
+            for sec in windows:
+                since = now - sec
+                rows = self._conn.execute(
+                    """SELECT event_type, COUNT(*) AS n
+                         FROM events
+                        WHERE account_id = ?
+                          AND event_type IN ('request_success', 'request_error')
+                          AND created_at >= ?
+                        GROUP BY event_type""",
+                    (account_id, since),
+                ).fetchall()
+                bucket = {"ok": 0, "err": 0}
+                for r in rows:
+                    if r["event_type"] == "request_success":
+                        bucket["ok"] = int(r["n"])
+                    elif r["event_type"] == "request_error":
+                        bucket["err"] = int(r["n"])
+                result[f"{sec}s"] = bucket
+        return result
+
 
 def account_to_public_dict(acc: Account) -> dict:
     """账号信息转字典 (供 API 返回)。"""
@@ -308,6 +402,14 @@ def account_to_public_dict(acc: Account) -> dict:
         "last_login_at": acc.last_login_at,
         "request_count": acc.request_count,
         "error_count": acc.error_count,
+        "error_kinds": {
+            "token/login 失效": acc.err_token_count,
+            "captcha 失效": acc.err_captcha_count,
+            "X-Signature 失效": acc.err_signature_count,
+            "限流": acc.err_rate_limit_count,
+            "服务端错误": acc.err_server_count,
+            "未知错误": acc.err_unknown_count,
+        },
         "has_state_file": has_state,
         "created_at": acc.created_at,
         "updated_at": acc.updated_at,

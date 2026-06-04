@@ -63,6 +63,17 @@
   .badge { background: #e0e7ff; color: #3730a3; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
   .muted { color: #888; }
   code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+  .err-cell { line-height: 1.5; }
+  .err-cell .err-kinds { font-size: 11px; color: #666; margin-top: 2px; cursor: help; }
+  .err-cell .err-kinds .k { display: inline-block; margin-right: 6px; }
+  .err-cell .err-kinds .k-warn { color: #b45309; }
+  .err-cell .err-kinds .k-danger { color: #b91c1c; }
+  .recent-stats { font-size: 11px; color: #666; line-height: 1.5; }
+  .recent-stats .rs-warn { color: #b45309; font-weight: 600; }
+  .err-rate-bar { display: inline-block; width: 40px; height: 4px; background: #e5e7eb; border-radius: 2px; vertical-align: middle; margin-left: 4px; overflow: hidden; }
+  .err-rate-bar > i { display: block; height: 100%; background: #10b981; }
+  .err-rate-bar.warn > i { background: #f59e0b; }
+  .err-rate-bar.danger > i { background: #ef4444; }
 </style>
 </head>
 <body>
@@ -84,7 +95,9 @@
   <table>
     <thead>
       <tr>
-        <th>ID</th><th>名称</th><th>状态</th><th>用户</th><th>请求数</th><th>错误</th>
+        <th>ID</th><th>名称</th><th>状态</th><th>用户</th>
+        <th>请求数<br><span class="muted" style="font-weight:400;font-size:11px">近 1h / 24h</span></th>
+        <th>错误<br><span class="muted" style="font-weight:400;font-size:11px">细分类型</span></th>
         <th>最后使用</th><th>备注</th><th>操作</th>
       </tr>
     </thead>
@@ -173,13 +186,48 @@ async function loadAccounts() {
       buttons.push(`<button onclick="setStatus(${a.id}, 'active')">启用</button>`);
     }
     buttons.push(`<button class="danger" onclick="delAccount(${a.id}, '${a.name.replace(/'/g, "\\'")}')">删除</button>`);
+
+    // 错误细分 (按累计从大到小, 只展示 >0 的; hover 显示完整列表)
+    const kinds = a.error_kinds || {};
+    const kindEntries = Object.entries(kinds)
+      .filter(([_, v]) => v > 0)
+      .sort((x, y) => y[1] - x[1]);
+    const kindShort = kindEntries.length === 0
+      ? '<span class="muted">—</span>'
+      : kindEntries.map(([k, v]) => {
+          const cls = (k === "token/login 失效" || k === "X-Signature 失效")
+            ? "k-warn" : (k === "限流" || k === "服务端错误") ? "k-danger" : "";
+          return `<span class="k ${cls}" title="${k}">${k.replace("token/login 失效", "token").replace("X-Signature 失效", "sign")}: ${v}</span>`;
+        }).join("");
+    const errRate = a.error_count > 0 ? Math.round(a.error_count / Math.max(a.request_count, 1) * 100) : 0;
+    const rateCls = errRate >= 30 ? "danger" : errRate >= 10 ? "warn" : "";
+
+    // 近 1h / 24h 统计
+    const rs = a.recent_stats || {};
+    const h1 = rs["3600s"] || {ok: 0, err: 0};
+    const h24 = rs["86400s"] || {ok: 0, err: 0};
+    const h1ErrRate = h1.ok + h1.err > 0 ? Math.round(h1.err / (h1.ok + h1.err) * 100) : 0;
+    const h24ErrRate = h24.ok + h24.err > 0 ? Math.round(h24.err / (h24.ok + h24.err) * 100) : 0;
+    const h1Cls = h1ErrRate >= 30 ? "rs-warn" : "";
+    const h24Cls = h24ErrRate >= 30 ? "rs-warn" : "";
+
     return `<tr>
       <td>${a.id}</td>
       <td><strong>${a.name}</strong></td>
       <td><span class="status status-${a.status}">${a.status} ${a.has_state_file ? '' : '<span class="muted" title="无 state 文件">⚠</span>'}</span></td>
       <td>${a.user_name || "-"} <span class="muted">${a.user_id ? `(${a.user_id.slice(0, 8)}...)` : ""}</span></td>
-      <td>${a.request_count}</td>
-      <td>${a.error_count}</td>
+      <td>
+        ${a.request_count}
+        <span class="err-rate-bar ${rateCls}" title="错误率 ${errRate}%"><i style="width:${Math.min(errRate, 100)}%"></i></span>
+        <div class="recent-stats">
+          <div>1h: ${h1.ok}✓ / ${h1.err}✗ <span class="${h1Cls}">${h1.ok + h1.err > 0 ? `(${h1ErrRate}%)` : ""}</span></div>
+          <div>24h: ${h24.ok}✓ / ${h24.err}✗ <span class="${h24Cls}">${h24.ok + h24.err > 0 ? `(${h24ErrRate}%)` : ""}</span></div>
+        </div>
+      </td>
+      <td class="err-cell">
+        <div><strong>${a.error_count}</strong></div>
+        <div class="err-kinds" title="点击查看完整细分">${kindShort}</div>
+      </td>
       <td><span class="muted" title="${fmtTs(a.last_used_at)}">${relTime(a.last_used_at)}</span></td>
       <td><span class="muted">${a.note || ""}</span></td>
       <td>${buttons.join(" ")}</td>
@@ -377,10 +425,26 @@ async function lookupBinding() {
   }
 }
 
-// 启动 + 定时刷新
+// 启动 + 定时刷新 (tab 隐藏时暂停, 切回时立即拉一次)
+let pollIntervalMs = 5000;
+let lastRefreshTs = 0;
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(() => {
+    if (document.hidden) return;
+    refreshAll();
+  }, pollIntervalMs);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshAll();
+});
+window.addEventListener("beforeunload", stopPolling);
+
 refreshAll();
-pollTimer = setInterval(refreshAll, 5000);
-window.addEventListener("beforeunload", () => clearInterval(pollTimer));
+startPolling();
 </script>
 </body>
 </html>

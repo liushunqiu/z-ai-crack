@@ -97,6 +97,7 @@ class ChatRuntimeService:
             """同步执行流式请求，将事件逐个放入队列。"""
             max_retries = 2
             last_error = None
+            last_error_kind: Optional[str] = None
             request_succeeded = False
 
             for attempt in range(max_retries + 1):
@@ -180,6 +181,7 @@ class ChatRuntimeService:
                             err_str = json.dumps(err, ensure_ascii=False)
                             kind = zaibot_core.classify_error(200, err_str)
                             last_error = err_str
+                            last_error_kind = kind
                             print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
                             if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
                                 print(f"[*] 可重试错误，保留 chat_id 并重试...", file=sys.stderr)
@@ -220,6 +222,7 @@ class ChatRuntimeService:
                 except zaibot_core.ZaibotHTTPError as e:
                     kind = zaibot_core.classify_error(e.status, e.body)
                     last_error = f"HTTP {e.status}: {e.body[:500]}"
+                    last_error_kind = kind
                     print(f"[!] ZaibotHTTP 错误 (attempt {attempt}): {last_error[:200]}", file=sys.stderr)
                     if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
                         print(f"[*] 可重试 HTTP 错误，重试...", file=sys.stderr)
@@ -229,6 +232,7 @@ class ChatRuntimeService:
                     return
                 except zaibot_core.ZaibotAPIError as e:
                     last_error = f"{e.kind}: {e.body[:500]}"
+                    last_error_kind = e.kind
                     print(f"[!] API 错误 (attempt {attempt}): {last_error[:200]}", file=sys.stderr)
                     if zaibot_core.is_retriable_error(e.kind) and attempt < max_retries:
                         print(f"[*] 可重试 API 错误，重试...", file=sys.stderr)
@@ -237,11 +241,15 @@ class ChatRuntimeService:
                     event_queue.put(None)
                     return
                 except zaibot_core.ZaibotError as e:
+                    last_error = str(e)
+                    last_error_kind = "未知错误"
                     print(f"[!] Zaibot 错误 (attempt {attempt}): {e}", file=sys.stderr)
                     event_queue.put(StreamError(str(e)))
                     event_queue.put(None)
                     return
                 except Exception as e:
+                    last_error = f"未知错误: {str(e)}"
+                    last_error_kind = "未知错误"
                     print(f"[!] 未知错误 (attempt {attempt}): {type(e).__name__}: {e}", file=sys.stderr)
                     event_queue.put(StreamError(f"未知错误: {str(e)}"))
                     event_queue.put(None)
@@ -251,7 +259,11 @@ class ChatRuntimeService:
             event_queue.put(None)
 
             # 标记请求结果
-            self.account_manager.mark_request(account_id, success=request_succeeded)
+            self.account_manager.mark_request(
+                account_id,
+                success=request_succeeded,
+                kind=last_error_kind,
+            )
 
         # 在线程池中执行（不阻塞事件循环）
         loop = asyncio.get_event_loop()
