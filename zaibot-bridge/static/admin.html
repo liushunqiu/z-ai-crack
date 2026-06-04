@@ -162,8 +162,8 @@ async function loadAccounts() {
     if (a.status === "pending_login" || a.status === "error") {
       buttons.push(`<button class="primary" onclick="startLogin(${a.id})">登录</button>`);
     }
-    // 只有 state 文件存在时才显示「测试」(否则点了也是 400)
-    if (a.status !== "active" && a.has_state_file) {
+    // 有 state 文件的账号都可以测试 (验证 token/captcha/API 是否还能用)
+    if (a.has_state_file) {
       buttons.push(`<button onclick="testAccount(${a.id})">测试</button>`);
     }
     if (a.status === "active") {
