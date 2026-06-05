@@ -8,16 +8,14 @@
 5. 产出 InternalStreamEvent 流
 """
 from __future__ import annotations
-
 import asyncio
 import json
 import os
 import queue
 import sys
 import threading
-import urllib.error
+import time
 import urllib.parse
-import urllib.request
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -52,6 +50,8 @@ class ChatRuntimeService:
 
     SESSION_MAX_SIZE = 256
     SESSION_TTL_SECONDS = 1800.0
+    # 每个账号的最小请求间隔（秒）
+    MIN_REQUEST_INTERVAL = 2.0
 
     def __init__(self, account_manager) -> None:
         self.account_manager = account_manager
@@ -59,6 +59,9 @@ class ChatRuntimeService:
             max_size=self.SESSION_MAX_SIZE,
             ttl_seconds=self.SESSION_TTL_SECONDS,
         )
+        # 每个账号的最后请求时间
+        self._last_request_time: dict[int, float] = {}
+        self._request_interval_lock = threading.Lock()
 
     def _get_or_create_session(self, session_id: str | None, model: str) -> zaibot_core.ChatSession:
         if session_id and session_id in self._sessions:
@@ -84,6 +87,22 @@ class ChatRuntimeService:
         prompt = self._flatten_messages(req, is_first=is_first)
 
         # 解析账号 (round-robin 绑定, sticky)
+        account = self.account_manager.resolve_account(session_id)
+        if account is None:
+            yield StreamError("没有可用的 Z.ai 账号,请先在 /admin 添加并登录")
+            return
+
+        # 请求间隔控制：防止触发限流
+        account_id = account.id
+        with self._request_interval_lock:
+            last_time = self._last_request_time.get(account_id, 0)
+            elapsed = time.time() - last_time
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                wait_time = self.MIN_REQUEST_INTERVAL - elapsed
+                print(f"[*] 请求间隔等待 {wait_time:.1f}s (account={account.name})", file=sys.stderr)
+                await asyncio.sleep(wait_time)
+            self._last_request_time[account_id] = time.time()
+
         account = self.account_manager.resolve_account(session_id)
         if account is None:
             yield StreamError("没有可用的 Z.ai 账号,请先在 /admin 添加并登录")
@@ -128,82 +147,113 @@ class ChatRuntimeService:
                         print(f"[*] 创建新 chat_id: {chat_id}", file=sys.stderr)
 
                     parent_id = session.last_assistant_id
-                    captcha_verify_param = self._get_fresh_captcha_for_account(account_id)
+                    captcha_verify_param, fingerprint = self._get_fresh_captcha_for_account(account_id)
+
+                    last_user_text = next(
+                        (m.content for m in reversed(req.messages)
+                         if m.role == "user" and m.content),
+                        None,
+                    )
+                    variables = {
+                        "{{USER_LANGUAGE}}": zaibot_core.detect_user_language(last_user_text or ""),
+                    }
 
                     body_dict, assistant_id = zaibot_core.build_body(
                         prompt, model=req.model, stream=True,
                         captcha_verify_param=captcha_verify_param,
                         chat_id=chat_id, parent_id=parent_id,
+                        variables=variables,
                     )
 
                     params = zaibot_core.build_query_params(
-                        token, user_id, timestamp, request_id, signature_timestamp
+                        token, user_id, timestamp, request_id, signature_timestamp,
+                        fingerprint=fingerprint,
                     )
                     cookie = zaibot_core.load_cookie_header_from_state(state_path)
-                    headers = zaibot_core.build_headers_with_cookie(token, signature, cookie)
+                    headers = zaibot_core.build_headers_with_cookie(
+                        token, signature, cookie, fingerprint=fingerprint,
+                    )
 
                     query_string = urllib.parse.urlencode(params)
                     path = f"/api/v2/chat/completions?{query_string}"
-                    body = json.dumps(body_dict, ensure_ascii=False).encode("utf-8")
+                    body_str = json.dumps(body_dict, ensure_ascii=False)
 
-                    print(f"[*] 发送流式请求到 Z.ai (account={account.name}, chat_id={chat_id})...", file=sys.stderr)
+                    print(f"[*] 发送流式请求到 Z.ai via Camoufox (account={account.name}, chat_id={chat_id})...", file=sys.stderr)
 
-                    full_url = f"https://chat.z.ai{path}"
-                    http_req = urllib.request.Request(
-                        full_url, data=body, headers=headers, method="POST"
-                    )
+                    # In-browser fetch via the captcha session's persistent page.
+                    # Going through Camoufox means the chat-completion request
+                    # shares the exact same TLS/HTTP/canvas fingerprint as the
+                    # captcha that was just generated — no verify_failed
+                    # mismatch.
+                    captcha_sess = self.account_manager.get_captcha_session(account_id)
+                    if captcha_sess is None:
+                        raise zaibot_core.ZaibotError("没有 captcha session 可用")
 
                     sse_event_count = 0
                     retriable_sse_error = False
+                    resp_status = None
+                    error_body_buf: list[str] = []
+                    saw_error_status = False
 
-                    try:
-                        resp = urllib.request.urlopen(http_req, timeout=180)
-                    except urllib.error.HTTPError as e:
-                        err_body = e.read().decode("utf-8", errors="replace")
-                        raise zaibot_core.ZaibotHTTPError(e.code, err_body, full_url) from None
-
-                    resp_status = resp.status
-                    if resp_status >= 400:
-                        print(f"[!] HTTP 错误: status={resp_status}", file=sys.stderr)
-                        raise zaibot_core.ZaibotHTTPError(resp_status, "", full_url)
-
-                    for raw_line in resp:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line or line == "data: [DONE]" or not line.startswith("data: "):
+                    for item in captcha_sess.fetch_streaming(path, headers, body_str):
+                        if "status" in item:
+                            resp_status = int(item["status"])
+                            if resp_status >= 400:
+                                saw_error_status = True
+                                print(f"[!] HTTP 错误: status={resp_status}", file=sys.stderr)
                             continue
-                        try:
-                            data = json.loads(line[6:])
-                        except json.JSONDecodeError:
+                        if "chunk" not in item:
                             continue
-
-                        err = zaibot_core._extract_error_payload(data)
-                        if err:
-                            err_str = json.dumps(err, ensure_ascii=False)
-                            kind = zaibot_core.classify_error(200, err_str)
-                            last_error = err_str
-                            last_error_kind = kind
-                            print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
-                            if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
-                                print(f"[*] 可重试错误，保留 chat_id 并重试...", file=sys.stderr)
-                                retriable_sse_error = True
-                                break
-                            event_queue.put(StreamError(err_str))
-                            event_queue.put(None)
-                            return
-
-                        payload = data.get("data", {}) if isinstance(data, dict) else {}
-                        if isinstance(payload, str):
+                        chunk_text = item["chunk"]
+                        if saw_error_status:
+                            error_body_buf.append(chunk_text)
                             continue
-                        if isinstance(payload, dict):
-                            phase = payload.get("phase")
-                            delta_content = payload.get("delta_content")
-                            if phase == "thinking" and delta_content:
-                                event_queue.put(ThinkingDelta(delta_content))
-                                sse_event_count += 1
-                            elif phase == "answer" and delta_content:
-                                for ev in tool_parser.feed(delta_content):
-                                    event_queue.put(ev)
+                        for raw_line in chunk_text.split("\n"):
+                            line = raw_line.strip()
+                            if not line or line == "data: [DONE]" or not line.startswith("data: "):
+                                continue
+                            try:
+                                data = json.loads(line[6:])
+                            except json.JSONDecodeError:
+                                continue
+
+                            err = zaibot_core._extract_error_payload(data)
+                            if err:
+                                err_str = json.dumps(err, ensure_ascii=False)
+                                kind = zaibot_core.classify_error(200, err_str)
+                                last_error = err_str
+                                last_error_kind = kind
+                                print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
+                                if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
+                                    if is_first and session.chat_id is not None and session.last_assistant_id is None:
+                                        session.chat_id = None
+                                        print(f"[*] 首次消息失败且无 assistant 回复，重置 chat_id 避免服务端状态污染", file=sys.stderr)
+                                    print(f"[*] 可重试错误，{'保留' if session.chat_id else '重置后'}chat_id 并重试...", file=sys.stderr)
+                                    retriable_sse_error = True
+                                    break
+                                event_queue.put(StreamError(err_str))
+                                event_queue.put(None)
+                                return
+
+                            payload = data.get("data", {}) if isinstance(data, dict) else {}
+                            if isinstance(payload, str):
+                                continue
+                            if isinstance(payload, dict):
+                                phase = payload.get("phase")
+                                delta_content = payload.get("delta_content")
+                                if phase == "thinking" and delta_content:
+                                    event_queue.put(ThinkingDelta(delta_content))
                                     sse_event_count += 1
+                                elif phase == "answer" and delta_content:
+                                    for ev in tool_parser.feed(delta_content):
+                                        event_queue.put(ev)
+                                        sse_event_count += 1
+                        if retriable_sse_error:
+                            break
+
+                    if saw_error_status:
+                        body = "".join(error_body_buf)
+                        raise zaibot_core.ZaibotHTTPError(resp_status or 0, body, path)
 
                     if retriable_sse_error:
                         continue
@@ -225,7 +275,18 @@ class ChatRuntimeService:
                     last_error_kind = kind
                     print(f"[!] ZaibotHTTP 错误 (attempt {attempt}): {last_error[:200]}", file=sys.stderr)
                     if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
-                        print(f"[*] 可重试 HTTP 错误，重试...", file=sys.stderr)
+                        if kind == "限流":
+                            # Aliyun WAF blocked us (status=405) - 风控限流
+                            # 风控会封半小时到一个小时，直接标记账号进入冷却期
+                            print(f"[!] 405 风控限流！账号 {account.name} 进入冷却期 (30分钟)", file=sys.stderr)
+                            # 标记账号进入冷却期
+                            self.account_manager.mark_rate_limited(account_id)
+                            # 不重试，直接返回错误
+                            event_queue.put(StreamError(f"账号被风控，已自动暂停 30 分钟: {last_error}", e.status))
+                            event_queue.put(None)
+                            return
+                        else:
+                            print(f"[*] 可重试 HTTP 错误，重试...", file=sys.stderr)
                         continue
                     event_queue.put(StreamError(last_error, e.status))
                     event_queue.put(None)
@@ -280,16 +341,25 @@ class ChatRuntimeService:
         """拍平消息。首次请求发送系统提示+工具定义+历史，后续请求只发新增消息（含工具结果）。"""
         return flatten_to_prompt(req, first_turn=is_first)
 
-    def _get_fresh_captcha_for_account(self, account_id: int, max_retries: int = 2) -> str | None:
-        """获取指定账号的 captcha token (每次调用都获取新 token, 因为 captcha 是一次性的)。"""
+    def _get_fresh_captcha_for_account(self, account_id: int, max_retries: int = 2) -> tuple[str | None, dict]:
+        """获取指定账号的 captcha token + 浏览器 fingerprint。
+
+        fingerprint 是从 Camoufox 浏览器里直接读出来的真实指纹，运行时再把
+        chat-completions 请求也交给同一个 Camoufox fetch 完成（见 execute()），
+        这样 captcha 的 `data` 字段和请求的浏览器上下文是 100% 一致的，
+        Aliyun 不会因为 TLS/canvas 指纹不一致而 verify_failed。
+
+        Returns (token, fingerprint_dict). fingerprint may be empty dict
+        if the browser couldn't be fingerprinted (falls back to defaults).
+        """
         for attempt in range(max_retries + 1):
             try:
                 sess = self.account_manager.get_captcha_session(account_id)
-                token = sess.get_captcha()
-                return token
+                token, fingerprint = sess.get_captcha()
+                return token, (fingerprint or {})
             except Exception as e:
                 print(f"[!] 获取 captcha 失败 (account_id={account_id}, attempt {attempt + 1}/{max_retries + 1}): {e}", file=sys.stderr)
-        return None
+        return None, {}
 
     def close_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

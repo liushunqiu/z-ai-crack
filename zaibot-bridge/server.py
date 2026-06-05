@@ -395,6 +395,38 @@ async def admin_update_account(account_id: int, request: Request):
         raise HTTPException(400, str(e))
 
 
+@app.post("/admin/api/accounts/{account_id}/reset")
+async def admin_reset_account(account_id: int):
+    """重置账号：清除状态文件，设置为 pending_login 状态。
+
+    用于处理被风控的账号：
+    1. 关闭浏览器会话
+    2. 删除状态文件
+    3. 将账号状态设置为 pending_login
+    """
+    if not account_manager:
+        raise HTTPException(503, "AccountManager not initialized")
+    try:
+        result = account_manager.reset_account(account_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"重置失败: {e}")
+
+
+@app.get("/admin/api/accounts/{account_id}/cooldown")
+async def admin_get_account_cooldown(account_id: int):
+    """获取账号的冷却期状态。"""
+    if not account_manager:
+        raise HTTPException(503, "AccountManager not initialized")
+    try:
+        info = account_manager.get_account_cooldown_info(account_id)
+        return info
+    except Exception as e:
+        raise HTTPException(500, f"获取冷却期状态失败: {e}")
+
+
 @app.get("/admin/api/bindings")
 async def admin_list_bindings():
     if not account_manager:

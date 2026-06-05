@@ -32,6 +32,8 @@ def is_real_user(role):
 
 def launch_and_login():
     """启动浏览器，让用户手动登录，等待真实账号登录后保存"""
+    import time
+
     print("[*] 启动 Camoufox 浏览器...")
     print("=" * 50)
     print("  [1] 浏览器已打开到 chat.z.ai/auth")
@@ -44,14 +46,39 @@ def launch_and_login():
     with Camoufox(headless=False, geoip=False) as browser:
         context = browser.new_context()
         page = context.new_page()
-        page.goto("https://chat.z.ai/auth")
-        page.wait_for_load_state("networkidle")
 
-        import time
+        # 优化：使用 domcontentloaded 而不是 networkidle
+        # networkidle 需要等待所有网络请求完成，可能很慢
+        # domcontentloaded 只需等待 DOM 加载完成
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"[*] 尝试导航到 chat.z.ai/auth (attempt {attempt + 1}/{max_retries})")
+                page.goto("https://chat.z.ai/auth", wait_until="domcontentloaded", timeout=90000)
+                print(f"[*] 导航成功")
+                break
+            except Exception as e:
+                print(f"[!] 导航失败 (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                else:
+                    print(f"[x] 无法访问 chat.z.ai，请检查网络或稍后重试")
+                    return
+
+        # 等待页面加载完成
+        time.sleep(3)
+
         real_token = None
-        for _ in range(600):
+        # 增加等待时间到 15 分钟
+        for _ in range(900):
             time.sleep(2)
-            token = page.evaluate("localStorage.getItem('token')")
+            try:
+                token = page.evaluate("localStorage.getItem('token')")
+            except Exception:
+                # 页面可能在跳转，继续等待
+                continue
+
             if token and token.strip():
                 token = token.strip()
                 role = get_user_role(token)
@@ -64,7 +91,7 @@ def launch_and_login():
                         print(f"[*] 当前为游客模式 (role: {role})，等待真实登录...")
 
         if not real_token:
-            print("\n[x] 等待登录超时 (10分钟)，请重试")
+            print("\n[x] 等待登录超时 (15分钟)，请重试")
             return
 
         state = context.storage_state()

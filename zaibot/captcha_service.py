@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 import threading
 from concurrent.futures import Future
+from typing import Optional, Tuple
 
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
@@ -26,21 +27,43 @@ SCENE_ID = "didk33e0"
 def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 15) -> tuple:
     """Trigger captcha flow on an already-loaded page and return (certify_id, security_token).
 
-    Fixed 10s timeout per attempt, no sleep between retries.
+    Simulates human-like interaction to avoid Aliyun Anti-Bot behavior scoring:
+      - Random warmup pause (page just loaded, real users take a beat)
+      - Focus textarea, then real keystrokes with jittered per-char delays
+      - "Thinking" pause after typing (real users hesitate before clicking send)
+      - Curved mouse path with a few waypoints, then real mouse click
     """
-    # Prepare input
-    page.evaluate("""() => {
+    import random
+
+    # Warmup: page just loaded, real user takes a moment to orient
+    warmup = random.uniform(0.4, 1.2)
+    time.sleep(warmup)
+
+    # Focus the textarea via real click so React picks up focus events
+    ta_box = page.evaluate("""() => {
         const ta = document.getElementById('chat-input');
         if (!ta) throw new Error('chat-input not found');
         ta.focus();
-        const nativeSetter = Object.getOwnPropertyDescriptor(
-            HTMLTextAreaElement.prototype, 'value'
-        ).set;
-        nativeSetter.call(ta, 'hello');
-        ta.dispatchEvent(new Event('input', { bubbles: true }));
-        ta.dispatchEvent(new Event('change', { bubbles: true }));
+        const r = ta.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
     }""")
-    time.sleep(1)
+    # A real user would mouse over to the textarea before typing
+    page.mouse.move(ta_box["x"] - random.uniform(20, 60), ta_box["y"] - random.uniform(10, 30), steps=8)
+    time.sleep(random.uniform(0.1, 0.25))
+    page.mouse.click(ta_box["x"], ta_box["y"])
+    time.sleep(random.uniform(0.1, 0.3))
+
+    # Type a short warmup string character-by-character with jittered delays.
+    # Real keystrokes trigger React's onChange and any custom input handlers.
+    text = "hi"
+    for ch in text:
+        page.keyboard.press(ch)
+        time.sleep(random.uniform(0.06, 0.18))
+
+    # "Thinking" pause — real users hesitate before clicking send
+    think = random.uniform(0.8, 2.5)
+    print(f"[*] thinking {think:.2f}s before send", file=sys.stderr)
+    time.sleep(think)
 
     certify_id = None
     security_token = None
@@ -52,12 +75,32 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
                 timeout=10000,
             ) as resp_info:
                 if attempt == 0 and click_send:
-                    page.evaluate("""() => {
+                    # Curved mouse path to the send button, then real click
+                    btn_pos = page.evaluate("""() => {
                         const btn = document.getElementById('send-message-button');
                         if (!btn) throw new Error('send button not found');
                         if (btn.disabled) throw new Error('send button still disabled');
-                        btn.click();
+                        const r = btn.getBoundingClientRect();
+                        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
                     }""")
+                    tx, ty = btn_pos["x"], btn_pos["y"]
+                    # Pick a start point a bit away from current mouse position
+                    sx = ta_box["x"] + random.uniform(-20, 20)
+                    sy = ta_box["y"] + random.uniform(-20, 20)
+                    # 4 waypoints with perpendicular jitter for a curved path
+                    for step in range(1, 5):
+                        t = step / 4
+                        # Perpendicular jitter peaks at midpoint, zero at ends
+                        jit = 1 - abs(t - 0.5) * 2
+                        ox = random.uniform(-12, 12) * jit
+                        oy = random.uniform(-12, 12) * jit
+                        mx = sx + (tx - sx) * t + ox
+                        my = sy + (ty - sy) * t + oy
+                        page.mouse.move(mx, my, steps=4)
+                        time.sleep(random.uniform(0.02, 0.06))
+                    # Small hover pause over the button
+                    time.sleep(random.uniform(0.05, 0.18))
+                    page.mouse.click(tx, ty)
 
             response = resp_info.value
             body = response.json()
@@ -95,6 +138,82 @@ def _build_captcha_raw(certify_id: str, security_token: str) -> tuple:
         "securityToken": security_token,
     }
     return base64.b64encode(json.dumps(param_obj).encode()).decode(), param_obj
+
+
+_FINGERPRINT_JS = r"""() => {
+    const uaData = navigator.userAgentData;
+    const brands = uaData && Array.isArray(uaData.brands)
+        ? uaData.brands.map(b => '"' + b.brand + '";v="' + b.version + '"').join(', ')
+        : '';
+    const platform = uaData && uaData.platform ? '"' + uaData.platform + '"' : '';
+    const mobile = uaData && typeof uaData.mobile === 'boolean' ? '?' + (uaData.mobile ? '1' : '0') : '?0';
+    const ua = navigator.userAgent;
+    const browserName = (function () {
+        if (/Edg\//.test(ua)) return 'Edge';
+        if (/Chrome\//.test(ua)) return 'Chrome';
+        if (/Firefox\//.test(ua)) return 'Firefox';
+        if (/Safari\//.test(ua) && !/Chrome\//.test(ua)) return 'Safari';
+        return 'Chrome';
+    })();
+    const osName = (function () {
+        if (/Windows NT/.test(ua)) return 'Windows';
+        if (/Mac OS X/.test(ua)) return 'Mac OS';
+        if (/Android/.test(ua)) return 'Android';
+        if (/iPhone|iPad|iPod/.test(ua)) return 'iOS';
+        if (/Linux/.test(ua)) return 'Linux';
+        return 'Unknown';
+    })();
+    const lang = navigator.language || 'en-US';
+    const langs = (navigator.languages && navigator.languages.length)
+        ? navigator.languages.join(',')
+        : lang;
+    return {
+        user_agent: ua,
+        language: lang,
+        languages: langs,
+        timezone: (Intl.DateTimeFormat().resolvedOptions().timeZone) || '',
+        cookie_enabled: String(navigator.cookieEnabled),
+        screen_width: String(window.screen.width),
+        screen_height: String(window.screen.height),
+        screen_resolution: window.screen.width + 'x' + window.screen.height,
+        viewport_height: String(window.innerHeight),
+        viewport_width: String(window.innerWidth),
+        viewport_size: window.innerWidth + 'x' + window.innerHeight,
+        color_depth: String(window.screen.colorDepth || 24),
+        pixel_ratio: String(window.devicePixelRatio || 1),
+        current_url: window.location.href,
+        pathname: window.location.pathname,
+        search: window.location.search,
+        hash: window.location.hash,
+        host: window.location.host,
+        hostname: window.location.hostname,
+        protocol: window.location.protocol,
+        referrer: document.referrer,
+        title: document.title,
+        timezone_offset: String(new Date().getTimezoneOffset()),
+        local_time: new Date().toString(),
+        utc_time: new Date().toUTCString(),
+        is_mobile: /Mobile|Android|iPhone|iPad/.test(ua) ? 'true' : 'false',
+        is_touch: String('ontouchstart' in window),
+        max_touch_points: String(navigator.maxTouchPoints || 0),
+        browser_name: browserName,
+        os_name: osName,
+        sec_ch_ua: brands,
+        sec_ch_ua_mobile: mobile,
+        sec_ch_ua_platform: platform,
+    };
+}"""
+
+
+def _collect_fingerprint(page) -> dict:
+    """Collect the browser fingerprint that the captcha `data` field is bound to.
+
+    The Aliyun captcha `data` payload is an AES-encrypted fingerprint digest
+    (see captured_data_fields.json). Z.ai/Aliyun verify this against the
+    fingerprint sent on the chat-completion request, so the urllib caller
+    MUST submit the same values the Camoufox browser reported.
+    """
+    return page.evaluate(_FINGERPRINT_JS)
 
 
 def get_captcha_verify_param(headless: bool = True, save: bool = True, timeout: int = 45) -> str:
@@ -163,15 +282,29 @@ class CaptchaSession:
         state_path: Path | None = None,
         token_path: Path | None = None,
         captcha_cache_path: Path | None = None,
+        # 新增：账号标识，用于生成独立指纹
+        account_id: str | None = None,
+        account_name: str | None = None,
     ):
         self.headless = headless
         self.state_path: Path = state_path or STATE_FILE
         self.token_path: Path = token_path or (BASE_DIR / "zaibot_token.txt")
         self.captcha_cache_path: Path = captcha_cache_path or CACHE_FILE
+        self.account_id = account_id
+        self.account_name = account_name
         self._browser_ctx = None
         self._browser = None
         self._context = None
         self._fetch_page = None
+        self._fingerprint: Optional[dict] = None
+        # Per-session captcha rate limit. Aliyun's WAF blocks fast loops
+        # (~20 captchas in <30s) with 405; throttle to stay under the cap.
+        # Bumped to 4s now that the flow itself is ~1.6-5s of human-like
+        # interaction — combined with the throttle, actual inter-captcha
+        # gap is ~5.6-9s, which keeps us under Aliyun's behavior threshold.
+        # Tune via set_captcha_rate_limit() at runtime if needed.
+        self._min_captcha_interval = 4.0
+        self._last_captcha_at = 0.0
         # Dedicated thread for ALL Playwright operations
         self._worker_thread: threading.Thread | None = None
         self._task_queue: queue.Queue = queue.Queue()
@@ -218,12 +351,40 @@ class CaptchaSession:
             )
 
         state = json.loads(self.state_path.read_text())
-        print(f"[*] Launching persistent Camoufox (headless={self.headless}, state={self.state_path})...", file=sys.stderr)
+        print(f"[*] Launching persistent Camoufox (headless={self.headless}, state={self.state_path}, account={self.account_name})...", file=sys.stderr)
 
-        self._browser_ctx = Camoufox(headless=self.headless, geoip=False)
+        # 为每个账号生成独立的浏览器配置
+        # 这样可以避免账号被关联
+        config = {
+            "headless": self.headless,
+            "geoip": False,
+        }
+
+        # 根据账号标识生成不同的指纹配置
+        if self.account_id:
+            # 使用 account_id 的哈希值来生成不同的配置
+            # 这样可以确保每个账号的配置是确定性的，但又不同
+            import hashlib
+            hash_val = int(hashlib.md5(self.account_id.encode()).hexdigest()[:8], 16)
+
+            # 根据哈希值选择不同的配置
+            # 操作系统指纹：随机选择 windows/macos/linux
+            os_choices = ["windows", "macos", "linux"]
+            config["os"] = os_choices[hash_val % len(os_choices)]
+
+            # 语言环境：根据账号选择不同的 locale
+            locale_choices = ["zh-CN", "en-US", "ja-JP", "ko-KR"]
+            config["locale"] = locale_choices[hash_val % len(locale_choices)]
+
+            # 阻止 WebRTC：根据账号决定
+            config["block_webrtc"] = (hash_val % 2 == 0)
+
+            print(f"[*] Browser config for {self.account_name}: os={config['os']}, locale={config['locale']}, block_webrtc={config['block_webrtc']}", file=sys.stderr)
+
+        self._browser_ctx = Camoufox(**config)
         self._browser = self._browser_ctx.__enter__()
         self._context = self._browser.new_context(storage_state=state)
-        print(f"[*] Persistent browser ready.", file=sys.stderr)
+        print(f"[*] Persistent browser ready (account={self.account_name}).", file=sys.stderr)
 
     def interactive_login(self, *, on_progress=None) -> bool:
         """Headful login flow: open chat.z.ai and wait for user to complete login.
@@ -275,15 +436,34 @@ class CaptchaSession:
             except Exception:
                 pass
 
-    def get_captcha(self, save: bool = True) -> str:
-        """Get a fresh captcha token. Runs on the dedicated worker thread."""
+    def get_captcha(self, save: bool = True) -> Tuple[str, dict]:
+        """Get a fresh captcha token + the browser fingerprint that produced it.
+
+        The fingerprint MUST be forwarded to the chat-completion HTTP request
+        so the Aliyun captcha `data` field and the request fingerprint agree.
+
+        Runs on the dedicated worker thread.
+        """
         return self._run_on_worker(self._get_captcha_impl, save)
 
-    def _get_captcha_impl(self, save: bool) -> str:
+    def get_fingerprint(self) -> Optional[dict]:
+        """Return the cached browser fingerprint (collected on first captcha call)."""
+        return self._fingerprint
+
+    def _get_captcha_impl(self, save: bool) -> Tuple[str, dict]:
         if not self._context:
             raise RuntimeError("Session not started. Call start() first.")
 
         print(f"[*] Getting fresh captcha token (new tab)...", file=sys.stderr)
+
+        # Per-session rate limit: Aliyun's WAF blocks bursts (~20 captchas in
+        # <30s) with HTTP 405. Sleep until the minimum interval has elapsed
+        # since the previous captcha from this session.
+        now = time.time()
+        wait = self._last_captcha_at + self._min_captcha_interval - now
+        if wait > 0:
+            print(f"[*] captcha rate limit: sleeping {wait:.2f}s (min interval {self._min_captcha_interval}s)", file=sys.stderr)
+            time.sleep(wait)
 
         page = self._context.new_page()
         try:
@@ -291,8 +471,20 @@ class CaptchaSession:
             page.wait_for_selector("#chat-input", timeout=15000)
 
             certify_id, security_token = _trigger_captcha_flow(page)
+
+            # Collect fingerprint from the same page so it's bound to the
+            # exact captcha that was just produced.
+            if self._fingerprint is None:
+                try:
+                    self._fingerprint = _collect_fingerprint(page)
+                    print(f"[*] Captured browser fingerprint (ua={self._fingerprint.get('user_agent', '')[:60]}...)", file=sys.stderr)
+                except Exception as e:
+                    print(f"[!] fingerprint collection failed: {e}", file=sys.stderr)
+                    self._fingerprint = None
         finally:
             page.close()
+
+        self._last_captcha_at = time.time()
 
         raw, param_obj = _build_captcha_raw(certify_id, security_token)
 
@@ -311,7 +503,11 @@ class CaptchaSession:
                 encoding="utf-8",
             )
 
-        return raw
+        return raw, (self._fingerprint or {})
+
+    def set_captcha_rate_limit(self, seconds: float):
+        """Override the per-session captcha minimum interval (in seconds)."""
+        self._min_captcha_interval = max(0.0, float(seconds))
 
     def get_fetch_page(self):
         """Get or create a persistent page on chat.z.ai for fetch requests."""

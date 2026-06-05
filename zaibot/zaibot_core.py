@@ -364,7 +364,47 @@ def load_captcha_cache(max_age_seconds: int = 240) -> Optional[str]:
     return None
 
 
-def build_query_params(token: str, user_id: str, timestamp: str, request_id: str, signature_timestamp: str, *, full_fingerprint: bool = True) -> Dict[str, str]:
+def _default_fingerprint() -> Dict[str, str]:
+    """Fallback fingerprint used when no live browser is available.
+
+    Kept for backwards compatibility with single-account CLI usage that
+    doesn't go through CaptchaSession.
+    """
+    return {
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "language": "en-US",
+        "languages": "en-US,en",
+        "timezone": DEFAULT_TIMEZONE,
+        "cookie_enabled": "true",
+        "screen_width": "1440",
+        "screen_height": "900",
+        "screen_resolution": "1440x900",
+        "viewport_height": "684",
+        "viewport_width": "1440",
+        "viewport_size": "1440x684",
+        "color_depth": "30",
+        "pixel_ratio": "1",
+        "current_url": "https://chat.z.ai/",
+        "pathname": "/",
+        "search": "",
+        "hash": "",
+        "host": "chat.z.ai",
+        "hostname": "chat.z.ai",
+        "protocol": "https:",
+        "referrer": "",
+        "title": "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5",
+        "timezone_offset": "-480",
+        "local_time": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "utc_time": time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()),
+        "is_mobile": "false",
+        "is_touch": "false",
+        "max_touch_points": "0",
+        "browser_name": "Chrome",
+        "os_name": "Mac OS",
+    }
+
+
+def build_query_params(token: str, user_id: str, timestamp: str, request_id: str, signature_timestamp: str, *, full_fingerprint: bool = True, fingerprint: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     params = {
         "timestamp": timestamp,
         "requestId": request_id,
@@ -375,50 +415,42 @@ def build_query_params(token: str, user_id: str, timestamp: str, request_id: str
         "signature_timestamp": signature_timestamp,
     }
     if full_fingerprint:
-        params.update({
-            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-            "language": "en-US",
-            "languages": "en-US,en",
-            "timezone": DEFAULT_TIMEZONE,
-            "cookie_enabled": "true",
-            "screen_width": "1440",
-            "screen_height": "900",
-            "screen_resolution": "1440x900",
-            "viewport_height": "684",
-            "viewport_width": "1440",
-            "viewport_size": "1440x684",
-            "color_depth": "30",
-            "pixel_ratio": "1",
-            "current_url": "https://chat.z.ai/",
-            "pathname": "/",
-            "search": "",
-            "hash": "",
-            "host": "chat.z.ai",
-            "hostname": "chat.z.ai",
-            "protocol": "https:",
-            "referrer": "",
-            "title": "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5",
-            "timezone_offset": "-480",
-            "local_time": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            "utc_time": time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()),
-            "is_mobile": "false",
-            "is_touch": "false",
-            "max_touch_points": "0",
-            "browser_name": "Chrome",
-            "os_name": "Mac OS",
-        })
+        fp = dict(_default_fingerprint())
+        if fingerprint:
+            fp.update({k: v for k, v in fingerprint.items() if v not in (None, "")})
+        # Always refresh time-bound fields even with a provided fingerprint.
+        fp["local_time"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        fp["utc_time"] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+        params.update(fp)
     return params
 
 
-def build_body(prompt: str, *, model: str = DEFAULT_MODEL, stream: bool = True, captcha_verify_param: Optional[str] = None, enable_thinking: bool = False, chat_id: Optional[str] = None, parent_id: Optional[str] = None, assistant_id: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+def build_body(prompt: str, *, model: str = DEFAULT_MODEL, stream: bool = True, captcha_verify_param: Optional[str] = None, enable_thinking: bool = False, chat_id: Optional[str] = None, parent_id: Optional[str] = None, assistant_id: Optional[str] = None, variables: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], str]:
     """Build the request body for chat completions.
 
     Returns (body_dict, assistant_id) so the caller can track the assistant
     message ID for chaining in a ChatSession.
+
+    `variables` is a partial override of the user-facing template variables
+    (e.g. {{USER_LANGUAGE}}). Anything not provided falls back to neutral
+    defaults; the values feed the upstream prompt template, NOT the signature
+    payload, so changing them does not invalidate X-Signature.
     """
     chat_id = chat_id or new_id()
     assistant_id = assistant_id or new_id()
     user_message_id = new_id()
+    base_variables: Dict[str, str] = {
+        "{{USER_NAME}}": "",
+        "{{USER_LOCATION}}": "Unknown",
+        "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "{{CURRENT_DATE}}": time.strftime("%Y-%m-%d"),
+        "{{CURRENT_TIME}}": time.strftime("%H:%M:%S"),
+        "{{CURRENT_WEEKDAY}}": time.strftime("%A"),
+        "{{CURRENT_TIMEZONE}}": DEFAULT_TIMEZONE,
+        "{{USER_LANGUAGE}}": "en-US",
+    }
+    if variables:
+        base_variables.update(variables)
     body: Dict[str, Any] = {
         "stream": stream,
         "model": model,
@@ -437,16 +469,7 @@ def build_body(prompt: str, *, model: str = DEFAULT_MODEL, stream: bool = True, 
             "vlm_website_mode": False,
             "enable_thinking": enable_thinking,
         },
-        "variables": {
-            "{{USER_NAME}}": "",
-            "{{USER_LOCATION}}": "Unknown",
-            "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "{{CURRENT_DATE}}": time.strftime("%Y-%m-%d"),
-            "{{CURRENT_TIME}}": time.strftime("%H:%M:%S"),
-            "{{CURRENT_WEEKDAY}}": time.strftime("%A"),
-            "{{CURRENT_TIMEZONE}}": DEFAULT_TIMEZONE,
-            "{{USER_LANGUAGE}}": "en-US",
-        },
+        "variables": base_variables,
         "chat_id": chat_id,
         "id": assistant_id,
         "current_user_message_id": user_message_id,
@@ -456,6 +479,25 @@ def build_body(prompt: str, *, model: str = DEFAULT_MODEL, stream: bool = True, 
     if captcha_verify_param:
         body["captcha_verify_param"] = captcha_verify_param
     return body, assistant_id
+
+
+def detect_user_language(text: str) -> str:
+    """Heuristic: any CJK character (Han / Hiragana / Katakana / Hangul) maps
+    to "zh-CN", otherwise "en-US".
+
+    Z.ai's upstream template switches task-language based on {{USER_LANGUAGE}};
+    this lets us route CJK user prompts to the CJK template branch without
+    relying on the client to send a header. Note: Japanese / Korean text is
+    also routed to "zh-CN" because the upstream only exposes a CN/EN split;
+    if a ja-JP / ko-KR template is added later, refine the ranges here.
+    """
+    if not text:
+        return "en-US"
+    for ch in text:
+        cp = ord(ch)
+        if (0x4E00 <= cp <= 0x9FFF) or (0x3040 <= cp <= 0x30FF) or (0xAC00 <= cp <= 0xD7AF):
+            return "zh-CN"
+    return "en-US"
 
 
 def load_cookie_header(domain_suffix: str = "chat.z.ai") -> str:
@@ -500,45 +542,51 @@ def load_cookie_header_from_state(state_path: Path, domain_suffix: str = "chat.z
     return "; ".join(pairs)
 
 
-def build_headers_with_cookie(token: str, signature: str, cookie: str) -> Dict[str, str]:
+def _fe_version_header_value() -> str:
+    """X-FE-Version header value (always includes the 'prod-fe-' prefix).
+
+    The current frontend bundle (prod-fe-1.1.42) sends the prefix, so we
+    must too. Sending a bare '1.1.x' is a fingerprint miss.
+    """
+    v = FE_VERSION
+    if not v.startswith("prod-fe-"):
+        v = "prod-fe-" + v
+    return v
+
+
+def _build_headers_internal(token: str, signature: str, cookie: str, fingerprint: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    fp = fingerprint or {}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json",
+        "Accept-Language": fp.get("language") or "en-US",
+        "Origin": "https://chat.z.ai",
+        "Referer": "https://chat.z.ai/",
+        "User-Agent": fp.get("user_agent") or _default_fingerprint()["user_agent"],
+        "X-FE-Version": _fe_version_header_value(),
+        "X-Region": "overseas",
+        "X-Signature": signature,
+    }
+    # Client Hints — sent by Chrome automatically; without them a request
+    # claiming a Chrome UA looks botty and Aliyun captcha `verify_failed`.
+    if fp.get("sec_ch_ua"):
+        headers["Sec-CH-UA"] = fp["sec_ch_ua"]
+        headers["Sec-CH-UA-Mobile"] = fp.get("sec_ch_ua_mobile") or "?0"
+        headers["Sec-CH-UA-Platform"] = fp.get("sec_ch_ua_platform") or '"macOS"'
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def build_headers_with_cookie(token: str, signature: str, cookie: str, fingerprint: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Variant of build_headers that takes an explicit Cookie header (per-account support)."""
-    fe_version = FE_VERSION.removeprefix("prod-fe-") if FE_VERSION.startswith("prod-fe-") else FE_VERSION
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream, application/json",
-        "Accept-Language": "en-US",
-        "Origin": "https://chat.z.ai",
-        "Referer": "https://chat.z.ai/",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "X-FE-Version": fe_version,
-        "X-Region": "overseas",
-        "X-Signature": signature,
-    }
-    if cookie:
-        headers["Cookie"] = cookie
-    return headers
+    return _build_headers_internal(token, signature, cookie, fingerprint)
 
 
-def build_headers(token: str, signature: str) -> Dict[str, str]:
-    # Strip 'prod-fe-' prefix from version (API expects plain version like '1.1.38')
-    fe_version = FE_VERSION.removeprefix("prod-fe-") if FE_VERSION.startswith("prod-fe-") else FE_VERSION
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream, application/json",
-        "Accept-Language": "en-US",
-        "Origin": "https://chat.z.ai",
-        "Referer": "https://chat.z.ai/",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-        "X-FE-Version": fe_version,
-        "X-Region": "overseas",
-        "X-Signature": signature,
-    }
+def build_headers(token: str, signature: str, fingerprint: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     cookie = load_cookie_header("chat.z.ai")
-    if cookie:
-        headers["Cookie"] = cookie
-    return headers
+    return _build_headers_internal(token, signature, cookie, fingerprint)
 
 
 def classify_error(status: int, body: str) -> str:
@@ -549,9 +597,13 @@ def classify_error(status: int, body: str) -> str:
         return "captcha_verify_param 失效或缺失"
     if any(x in text for x in ["signature", "x-signature", "sign"]):
         return "X-Signature 失效或签名参数不匹配"
-    if status == 429 or "rate" in text:
+    if status == 429 or status == 405 or "rate" in text or "<title>405</title>" in text:
         return "限流"
-    if status >= 500:
+    # SSE 流中上游 5xx 也会以 status=200 出现，靠 body 文本/code 字段识别。
+    if status >= 500 or any(x in text for x in [
+        "internal_error", "service_unavailable", "bad_gateway",
+        "oops, something went wrong", "please try again later",
+    ]):
         return "服务端错误"
     return "未知错误"
 
@@ -710,6 +762,7 @@ def post_chat(prompt: str, *, model: str = DEFAULT_MODEL, stream: bool = True, c
         prompt, model=model, stream=stream,
         captcha_verify_param=captcha_verify_param,
         chat_id=chat_id, parent_id=parent_id,
+        variables={"{{USER_LANGUAGE}}": detect_user_language(prompt)},
     )
 
     params = build_query_params(token, user_id, timestamp, request_id, signature_timestamp, full_fingerprint=full_fingerprint)

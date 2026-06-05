@@ -73,6 +73,7 @@ _ACCOUNT_MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN err_rate_limit_count INTEGER DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN err_server_count INTEGER DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN err_unknown_count INTEGER DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN cooldown_until REAL DEFAULT 0",
 ]
 
 # 错误 kind -> 计数列名
@@ -86,7 +87,7 @@ ERROR_KIND_COLUMNS = {
 }
 
 
-ACCOUNT_STATUSES = {"pending_login", "active", "error", "disabled"}
+ACCOUNT_STATUSES = {"pending_login", "active", "error", "disabled", "cooldown"}
 
 
 # 错误 kind 归一化 (未知类型归到 err_unknown_count)
@@ -122,6 +123,7 @@ class Account:
     err_rate_limit_count: int = 0
     err_server_count: int = 0
     err_unknown_count: int = 0
+    cooldown_until: float = 0  # 风控冷却期结束时间戳
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Account":
@@ -222,6 +224,7 @@ class AccountDB:
         request_count_delta: Optional[int] = None,
         error_count_delta: Optional[int] = None,
         error_kind_delta: Optional[tuple[str, int]] = None,
+        cooldown_until: Optional[float] = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -245,6 +248,8 @@ class AccountDB:
             kind, delta = error_kind_delta
             col = _column_for_error_kind(kind)
             sets.append(f"{col}={col}+?"); vals.append(delta)
+        if cooldown_until is not None:
+            sets.append("cooldown_until=?"); vals.append(cooldown_until)
         if not sets:
             return
         sets.append("updated_at=?"); vals.append(time.time())

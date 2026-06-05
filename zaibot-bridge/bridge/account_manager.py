@@ -51,6 +51,7 @@ class AccountManager:
         """启动时检查所有账号:
         - active 账号: state 文件丢失 → 标 error
         - pending_login 账号: state 文件存在且 token 有效 → 自动激活
+        - cooldown 账号: 检查冷却期是否结束
         """
         for acc in self.db.list_accounts():
             state = Path(acc.storage_path)
@@ -64,6 +65,26 @@ class AccountManager:
                     result = self._try_activate_from_state(acc.id)
                     if result:
                         print(f"[account-manager] auto-activated account {acc.name}: {result}", file=sys.stderr)
+            elif acc.status == "cooldown":
+                # 检查冷却期是否结束
+                now = time.time()
+                cooldown_until = getattr(acc, 'cooldown_until', 0) or 0
+                if now >= cooldown_until:
+                    self.db.update_account(
+                        acc.id,
+                        status="active",
+                        note="冷却期结束，自动恢复",
+                        cooldown_until=0,
+                    )
+                    self.db.record_event(
+                        "cooldown_expired",
+                        account_id=acc.id,
+                        detail="冷却期结束，自动恢复",
+                    )
+                    print(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active", file=sys.stderr)
+                else:
+                    remaining = (cooldown_until - now) / 60
+                    print(f"[account-manager] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟", file=sys.stderr)
 
     # ---------- 账号管理 (admin API) ----------
 
@@ -108,15 +129,74 @@ class AccountManager:
         return ok
 
     def set_status(self, account_id: int, status: str) -> dict:
-        if status not in {"pending_login", "active", "error", "disabled"}:
+        if status not in {"pending_login", "active", "error", "disabled", "cooldown"}:
             raise ValueError(f"非法 status: {status}")
         acc = self.db.get_account(account_id)
         if not acc:
             raise ValueError(f"账号不存在: {account_id}")
         self.db.update_account(account_id, status=status)
-        if status in {"disabled", "error"}:
+        if status in {"disabled", "error", "cooldown"}:
             self._close_session(account_id)
         return account_to_public_dict(self.db.get_account(account_id))
+
+    def reset_account(self, account_id: int) -> dict:
+        """重置账号：清除状态文件，设置为 pending_login 状态。
+
+        用于处理被风控的账号：
+        1. 关闭浏览器会话
+        2. 删除状态文件
+        3. 将账号状态设置为 pending_login
+        4. 清除相关的 session 绑定
+
+        Returns:
+            包含操作结果的字典
+        """
+        acc = self.db.get_account(account_id)
+        if not acc:
+            raise ValueError(f"账号不存在: {account_id}")
+
+        # 1. 关闭浏览器会话
+        self._close_session(account_id)
+
+        # 2. 删除状态文件
+        state_path = Path(acc.storage_path)
+        if state_path.exists():
+            try:
+                state_path.unlink()
+                print(f"[account-manager] 已删除状态文件: {state_path}", file=sys.stderr)
+            except Exception as e:
+                print(f"[account-manager] 删除状态文件失败: {e}", file=sys.stderr)
+
+        # 3. 清除该账号的所有 session 绑定
+        with self._session_lock:
+            for b in self.db.list_bindings_for_account(account_id):
+                self.db.delete_binding(b.session_id)
+                print(f"[account-manager] 已清除 session 绑定: {b.session_id}", file=sys.stderr)
+
+        # 4. 将账号状态设置为 pending_login
+        self.db.update_account(
+            account_id,
+            status="pending_login",
+            note="手动重置：清除风控状态",
+            user_id="",
+            user_name="",
+            last_login_at=0,
+        )
+
+        # 5. 记录事件
+        self.db.record_event(
+            "account_reset",
+            account_id=account_id,
+            detail=f"手动重置账号 {acc.name}",
+        )
+
+        print(f"[account-manager] 账号 {acc.name} 已重置为 pending_login 状态", file=sys.stderr)
+
+        return {
+            "ok": True,
+            "message": f"账号 {acc.name} 已重置，请重新登录",
+            "account": account_to_public_dict(self.db.get_account(account_id)),
+        }
 
     def rebind_session(self, session_id: str, account_id: int) -> dict:
         """管理员手动改绑 session_id 到新账号。"""
@@ -198,13 +278,30 @@ class AccountManager:
                 try:
                     if on_progress:
                         on_progress("opening_login_page")
-                    # 跟 zaibot/login.py 一样, 用 auth 页面
-                    page.goto("https://chat.z.ai/auth", wait_until="networkidle", timeout=60000)
+
+                    # 优化：使用 domcontentloaded 而不是 networkidle，避免超时
+                    # networkidle 需要等待所有网络请求完成，可能很慢
+                    # domcontentloaded 只需等待 DOM 加载完成
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            print(f"[*] 尝试导航到 chat.z.ai/auth (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                            page.goto("https://chat.z.ai/auth", wait_until="domcontentloaded", timeout=90000)
+                            print(f"[*] 导航成功", file=sys.stderr)
+                            break
+                        except Exception as e:
+                            print(f"[!] 导航失败 (attempt {attempt + 1}): {e}", file=sys.stderr)
+                            if attempt < max_retries - 1:
+                                time.sleep(5)
+                                continue
+                            else:
+                                raise
 
                     if on_progress:
                         on_progress("waiting_for_login")
 
-                    deadline = time.time() + 600  # 10 分钟
+                    # 增加等待时间到 15 分钟
+                    deadline = time.time() + 900  # 15 分钟
                     while time.time() < deadline:
                         # 用与 login.py 一致的简单取法
                         try:
@@ -286,7 +383,7 @@ class AccountManager:
 
                     if on_progress:
                         on_progress("login_timeout")
-                    self.db.update_account(account_id, status="error", note="登录超时 (10 分钟)")
+                    self.db.update_account(account_id, status="error", note="登录超时 (15 分钟)")
                     self.db.record_event("login_timeout", account_id=account_id)
                     return False
                 finally:
@@ -295,10 +392,17 @@ class AccountManager:
                     except Exception:
                         pass
         except Exception as e:
-            self.db.update_account(account_id, status="error", note=f"登录异常: {e}")
-            self.db.record_event("login_failed", account_id=account_id, detail=str(e))
+            error_msg = str(e)
+            # 提供更友好的错误信息
+            if "Timeout" in error_msg or "timeout" in error_msg:
+                error_msg = "网络连接超时，请检查网络或稍后重试"
+            elif "net::ERR" in error_msg:
+                error_msg = "网络连接失败，请检查网络设置"
+
+            self.db.update_account(account_id, status="error", note=f"登录异常: {error_msg}")
+            self.db.record_event("login_failed", account_id=account_id, detail=error_msg)
             if on_progress:
-                on_progress(f"login_error: {e}")
+                on_progress(f"login_error: {error_msg}")
             return False
 
     def test_account(self, account_id: int, *, on_progress=None) -> dict:
@@ -339,7 +443,7 @@ class AccountManager:
             return {"ok": False, "message": f"启动 captcha 浏览器失败: {e}"}
 
         try:
-            captcha = captcha_sess.get_captcha()
+            captcha, _fingerprint = captcha_sess.get_captcha()
         except Exception as e:
             captcha_sess.close()
             return {"ok": False, "message": f"获取 captcha 失败: {e}"}
@@ -475,9 +579,13 @@ class AccountManager:
         - 若 session_id 已有绑定且账号 active: 返回该账号
         - 若 session_id 无绑定: 选一个 active 账号 (round-robin), 写入绑定
         - 若 session_id 绑定到非 active 账号: 重新分配
+        - 自动跳过冷却中的账号
 
         返回 None 表示无可用账号。
         """
+        # 先检查是否有冷却期结束的账号，自动恢复
+        self.check_cooldown_accounts()
+
         if session_id:
             binding = self.db.get_binding(session_id)
             if binding:
@@ -485,6 +593,12 @@ class AccountManager:
                 if acc and acc.status == "active":
                     self.db.touch_binding(session_id)
                     return acc
+                # 如果账号在冷却期，返回 None 而不是重新分配
+                if acc and acc.status == "cooldown":
+                    cooldown_info = self.get_account_cooldown_info(acc.id)
+                    remaining = cooldown_info.get("remaining_minutes", 0)
+                    print(f"[!] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟", file=sys.stderr)
+                    return None
                 # 绑定失效, 重新选
                 self.db.delete_binding(session_id)
         # 新会话或旧绑定失效, 选一个 active 账号
@@ -529,6 +643,8 @@ class AccountManager:
             sess = CaptchaSession(
                 headless=True,
                 state_path=state_path,
+                account_id=str(account_id),
+                account_name=acc.name,
             )
             sess.start()
             self._sessions[account_id] = sess
@@ -577,6 +693,10 @@ class AccountManager:
         )
         if not success and kind:
             kwargs["error_kind_delta"] = (kind, 1)
+
+        # 检测连续限流错误，自动禁用账号
+        if not success and kind and "限流" in kind:
+            self._check_rate_limit_errors(account_id)
         self.db.update_account(account_id, **kwargs)
         # 写入 events, 用于近 1h/24h 统计
         self.db.record_event(
@@ -584,3 +704,127 @@ class AccountManager:
             account_id=account_id,
             detail=kind or "",
         )
+
+    def _check_rate_limit_errors(self, account_id: int) -> None:
+        """检测连续限流错误，自动禁用账号。
+
+        如果一个账号在短时间内连续出现限流错误，说明可能被风控，
+        自动将账号状态设置为 disabled，避免继续触发风控。
+        """
+        # 获取最近 1 小时的错误记录
+        stats = self.db.count_recent_request_stats(account_id)
+        if not stats:
+            return
+
+        # 获取 1 小时内的错误统计
+        hour_stats = stats.get("1h", {})
+        error_count = hour_stats.get("err", 0)
+
+        # 如果最近 1 小时内有 3 次以上错误，检查是否是限流错误
+        # 由于我们无法直接获取限流错误的数量，我们使用错误总数作为指标
+        # 如果错误数 >= 3，且当前是限流错误，则自动禁用
+        if error_count >= 3:
+            acc = self.db.get_account(account_id)
+            if acc and acc.status == "active":
+                print(f"[!] 账号 {acc.name} 在 1 小时内出现 {error_count} 次错误，自动禁用", file=sys.stderr)
+                self.db.update_account(
+                    account_id,
+                    status="disabled",
+                    note=f"自动禁用：1 小时内 {error_count} 次错误（可能被风控）",
+                )
+                self.db.record_event(
+                    "auto_disable",
+                    account_id=account_id,
+                    detail=f"1 小时内 {error_count} 次错误",
+                )
+                # 关闭浏览器会话
+                self._close_session(account_id)
+
+    def mark_rate_limited(self, account_id: int, cooldown_minutes: int = 30) -> None:
+        """标记账号被风控限流，进入冷却期。
+
+        Args:
+            account_id: 账号 ID
+            cooldown_minutes: 冷却时间（分钟），默认 30 分钟
+        """
+        acc = self.db.get_account(account_id)
+        if not acc:
+            return
+
+        cooldown_until = time.time() + (cooldown_minutes * 60)
+
+        print(f"[!] 账号 {acc.name} 被风控，进入冷却期 {cooldown_minutes} 分钟", file=sys.stderr)
+
+        # 更新账号状态为冷却中
+        self.db.update_account(
+            account_id,
+            status="cooldown",
+            note=f"风控冷却中，预计 {cooldown_minutes} 分钟后恢复",
+            cooldown_until=cooldown_until,
+        )
+
+        # 记录事件
+        self.db.record_event(
+            "rate_limited",
+            account_id=account_id,
+            detail=f"进入冷却期 {cooldown_minutes} 分钟",
+        )
+
+        # 关闭浏览器会话
+        self._close_session(account_id)
+
+    def check_cooldown_accounts(self) -> list[dict]:
+        """检查并恢复冷却期结束的账号。
+
+        Returns:
+            恢复的账号列表
+        """
+        recovered = []
+        now = time.time()
+
+        for acc in self.db.list_accounts():
+            if acc.status == "cooldown":
+                cooldown_until = getattr(acc, 'cooldown_until', 0) or 0
+                if now >= cooldown_until:
+                    # 冷却期结束，恢复为 active 状态
+                    self.db.update_account(
+                        acc.id,
+                        status="active",
+                        note="冷却期结束，自动恢复",
+                        cooldown_until=0,
+                    )
+                    self.db.record_event(
+                        "cooldown_expired",
+                        account_id=acc.id,
+                        detail="冷却期结束，自动恢复",
+                    )
+                    print(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active", file=sys.stderr)
+                    recovered.append(account_to_public_dict(self.db.get_account(acc.id)))
+
+        return recovered
+
+    def get_account_cooldown_info(self, account_id: int) -> dict:
+        """获取账号的冷却期信息。
+
+        Returns:
+            包含冷却期状态的字典
+        """
+        acc = self.db.get_account(account_id)
+        if not acc:
+            return {"status": "not_found"}
+
+        if acc.status != "cooldown":
+            return {"status": acc.status, "in_cooldown": False}
+
+        cooldown_until = getattr(acc, 'cooldown_until', 0) or 0
+        now = time.time()
+        remaining_seconds = max(0, cooldown_until - now)
+        remaining_minutes = remaining_seconds / 60
+
+        return {
+            "status": "cooldown",
+            "in_cooldown": True,
+            "cooldown_until": cooldown_until,
+            "remaining_seconds": remaining_seconds,
+            "remaining_minutes": round(remaining_minutes, 1),
+        }

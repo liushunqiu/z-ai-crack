@@ -86,7 +86,8 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
         for attempt in range(3):
             print(f"[*] 使用持久浏览器获取 captcha (attempt {attempt + 1}/3)...", file=sys.stderr)
             try:
-                return captcha_session.get_captcha()
+                token, _fp = captcha_session.get_captcha()
+                return token
             except Exception as sess_err:
                 print(f"[!] 持久浏览器获取失败: {sess_err}", file=sys.stderr)
                 if attempt < 2:
@@ -124,7 +125,7 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
     captcha = None
     if captcha_session:
         try:
-            captcha = captcha_session.get_captcha()
+            captcha, _fp = captcha_session.get_captcha()
         except Exception as e:
             print(f"[!] 获取 captcha 失败: {e}，将在需要时重试", file=sys.stderr)
 

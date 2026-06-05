@@ -172,9 +172,9 @@ def _escape_xml_text(text: str) -> str:
 #   照搬 PromptCompatService.injectToolDefinitions + buildToolCallInstructions
 # ──────────────────────────────────────────────────────────────
 
-_TOOL_CALL_INSTRUCTIONS = """## TOOL CALL FORMAT (MANDATORY)
+_TOOL_CALL_INSTRUCTIONS = """## TOOL CALL FORMAT
 
-When calling tools, output EXACTLY this format with NO other text:
+To call a tool, emit a single block in this exact shape:
 
 <|DSML|tool_calls>
   <|DSML|invoke name="TOOL_NAME">
@@ -182,33 +182,17 @@ When calling tools, output EXACTLY this format with NO other text:
   </|DSML|invoke>
 </|DSML|tool_calls>
 
-## CRITICAL RULES
+You may write a brief one-sentence intent BEFORE the block when it helps (e.g. "Running tests now."). Do NOT put prose AFTER the block, and do NOT wrap the block in markdown fences.
 
-1. **Output ONLY the tool call block** — no text before or after, no markdown fences, no explanations.
-2. **ALL tools in ONE block** — put multiple <|DSML|invoke> inside a single <|DSML|tool_calls>.
-3. **Strings use CDATA** — wrap ALL string values in <![CDATA[...]]> (code, paths, content, etc).
-4. **Objects/Arrays use XML structure** — NOT raw JSON. Objects = nested parameters, Arrays = <item> children.
-5. **Numbers/booleans/null = plain text** — no quotes, no CDATA.
-6. **Use exact parameter names** from the tool schema. Do not invent fields.
-7. **Creating new files** — use the Write/write_file tool directly. Do NOT use Bash with heredoc/echo/cat/printf to create files.
-8. **Editing existing files** — use the apply_patch tool with unified diff format. Do NOT use sed/awk or Bash to edit files.
-9. **File content = raw content only** — in Write tool, provide pure file content without any shell syntax.
+## RULES
 
-## PARAMETER EXAMPLES
-
-String:  <|DSML|parameter name="path"><![CDATA[/tmp/file.txt]]></|DSML|parameter>
-Object:  <|DSML|parameter name="config"><port><![CDATA[8080]]></port><host><![CDATA[localhost]]></host></|DSML|parameter>
-Array:   <|DSML|parameter name="items"><item><![CDATA[a]]></item><item><![CDATA[b]]></item></|DSML|parameter>
-Number:  <|DSML|parameter name="count">42</|DSML|parameter>
-Boolean: <|DSML|parameter name="enabled">true</|DSML|parameter>
-
-## TOOL USAGE
-
-- **Create new files** → use Write or write_file tool
-- **Edit existing files** → use apply_patch tool with unified diff
-- **Read files** → use Read or read_file tool
-- **Run commands** → use Bash tool
-- **Search code** → use Grep or search_files tool
+1. **One block per turn** — if you need multiple tool calls, put several <|DSML|invoke> inside the same <|DSML|tool_calls>.
+2. **Strings → CDATA** — wrap every string value in <![CDATA[...]]>, including code, paths, and file content.
+3. **Objects / arrays → nested XML** — never raw JSON. Objects become nested <|DSML|parameter>; arrays use <item> children.
+4. **Numbers / booleans / null → plain text** — no quotes, no CDATA.
+5. **Use the exact parameter names from the tool schema** — do not invent or rename fields.
+6. **Write files via the Write tool, never via Bash heredoc / echo / printf** — the Write tool's `content` parameter is raw file content, not shell syntax.
+7. **Edit files via apply_patch (unified diff) or Edit** — do not use sed / awk in Bash.
 """
 
 
@@ -355,9 +339,9 @@ def format_tools_section(tools: list[dict]) -> str:
         return ""
     return (
         "\n\nYou have access to these tools:\n\n"
-        "CRITICAL: You MUST use EXACTLY the tool names listed below. "
-        "Do NOT invent, rename, or substitute tool names.\n"
-        f"Available tool names: {', '.join(names)}\n\n"
+        f"Available tool names: {', '.join(names)}\n"
+        "Use one of these names verbatim in <|DSML|invoke name=\"...\">; "
+        "do not invent, rename, or substitute tool names.\n\n"
         + "\n".join(schemas) + "\n"
         + _TOOL_CALL_INSTRUCTIONS
         + "\n"
