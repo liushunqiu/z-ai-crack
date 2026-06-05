@@ -74,6 +74,11 @@
   .err-rate-bar > i { display: block; height: 100%; background: #10b981; }
   .err-rate-bar.warn > i { background: #f59e0b; }
   .err-rate-bar.danger > i { background: #ef4444; }
+  .table-wrap { overflow-x: auto; max-width: 100%; }
+  .account-table { table-layout: fixed; min-width: 1100px; }
+  .account-table th, .account-table td { word-break: break-word; vertical-align: top; }
+  .account-table .recent-stats, .account-table .err-kinds, .account-table .btns { white-space: nowrap; }
+  .account-table .err-kinds { white-space: normal; }
 </style>
 </head>
 <body>
@@ -92,7 +97,19 @@
     <button onclick="refreshAll()">刷新</button>
   </div>
   <div id="account-progress"></div>
-  <table>
+  <div class="table-wrap">
+  <table class="account-table">
+    <colgroup>
+      <col style="width:50px">
+      <col style="width:150px">
+      <col style="width:120px">
+      <col style="width:160px">
+      <col style="width:140px">
+      <col style="width:170px">
+      <col style="width:100px">
+      <col>
+      <col style="width:210px">
+    </colgroup>
     <thead>
       <tr>
         <th>ID</th><th>名称</th><th>状态</th><th>用户</th>
@@ -105,6 +122,7 @@
       <tr><td colspan="9" class="empty">加载中...</td></tr>
     </tbody>
   </table>
+  </div>
 </div>
 
 <div class="card">
@@ -163,8 +181,8 @@ function relTime(ts) {
   return `${Math.floor(diff / 86400)}天前`;
 }
 
-async function loadAccounts() {
-  const data = await api("/admin/api/accounts");
+async function loadAccounts(data) {
+  if (!data) data = await api("/admin/api/accounts");
   const tbody = $("account-tbody");
   if (!data.accounts.length) {
     tbody.innerHTML = `<tr><td colspan="9" class="empty">还没有账号,请先添加</td></tr>`;
@@ -230,7 +248,7 @@ async function loadAccounts() {
       </td>
       <td><span class="muted" title="${fmtTs(a.last_used_at)}">${relTime(a.last_used_at)}</span></td>
       <td><span class="muted">${a.note || ""}</span></td>
-      <td>${buttons.join(" ")}</td>
+      <td><div class="btns">${buttons.join(" ")}</div></td>
     </tr>`;
   }).join("");
 }
@@ -286,7 +304,7 @@ async function refreshAll() {
     const accData = await api("/admin/api/accounts");
     window.__allAccountIds = accData.accounts.map(a => a.id);
     window.__accountMap = Object.fromEntries(accData.accounts.map(a => [a.id, a]));
-    await Promise.all([loadAccounts(), loadBindings(), loadEvents()]);
+    await Promise.all([loadAccounts(accData), loadBindings(), loadEvents()]);
   } catch (e) {
     console.error(e);
   }

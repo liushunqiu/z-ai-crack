@@ -39,6 +39,23 @@ class AccountManager:
         # round-robin 游标
         self._rr_lock = threading.Lock()
         self._rr_cursor = 0
+        # ====== IP 级别风控 (4G/NAT 共享出口场景) ======
+        # 全局请求最小间隔: 任意账号两次请求的最小时间差
+        self.GLOBAL_MIN_INTERVAL = 1.0
+        # 全局冷却: 任意账号触发限流时设置, 所有账号暂停
+        self._global_cooldown_until: float = 0
+        self._global_cooldown_lock = threading.Lock()
+        # 集群失败: 滑动窗口内的 (timestamp, account_id) 元组
+        # 修复多账号误杀: 只有 N 个**不同账号**都失败才触发 IP 冷却
+        self._cluster_failures: list[tuple[float, int]] = []
+        self._cluster_lock = threading.Lock()
+        self._last_global_request_time: float = 0
+        # ====== 全局 captcha 并发限制 (4G IP 共享场景) ======
+        # 同一 IP 上同时只能有 N 个账号在解 captcha, 否则 WAF 判定为刷 captcha
+        self.MAX_CONCURRENT_CAPTCHAS = 2
+        self._captcha_in_flight = 0
+        self._captcha_slot_lock = threading.Lock()
+        self._captcha_slot_cv = threading.Condition(self._captcha_slot_lock)
         # 启动时尝试为 active 账号恢复浏览器
         self._startup_init()
 
@@ -572,6 +589,104 @@ class AccountManager:
         }
 
     # ---------- 请求执行时的查找 ----------
+
+    def check_ip_cooldown(self) -> Optional[float]:
+        """检查是否在全局 IP 冷却期。返回剩余秒数, None 表示不在冷却。"""
+        with self._global_cooldown_lock:
+            now = time.time()
+            if now < self._global_cooldown_until:
+                return self._global_cooldown_until - now
+            return None
+
+    def trigger_ip_cooldown(self, minutes: int, reason: str = ""):
+        """触发全局 IP 冷却, 所有账号暂停。"""
+        with self._global_cooldown_lock:
+            self._global_cooldown_until = time.time() + minutes * 60
+            print(f"[!] IP 级别风控: 全局冷却 {minutes} 分钟 ({reason})", file=sys.stderr)
+        self.db.record_event(
+            "ip_cooldown",
+            detail=f"{minutes}min: {reason}",
+        )
+
+    def acquire_ip_slot(self) -> float:
+        """获取全局请求槽位: 阻塞直到距上次请求 ≥ GLOBAL_MIN_INTERVAL。
+
+        返回实际等待的秒数。
+        """
+        while True:
+            with self._global_cooldown_lock:
+                wait = self._last_global_request_time + self.GLOBAL_MIN_INTERVAL - time.time()
+                if wait <= 0:
+                    self._last_global_request_time = time.time()
+                    return 0.0
+            time.sleep(min(wait, 0.5))
+
+    def acquire_captcha_slot(self) -> None:
+        """获取全局 captcha 槽位: 阻塞直到 in-flight captcha < MAX_CONCURRENT_CAPTCHAS。
+
+        4G/NAT 共享出口场景下, 多个账号同时触发 InitCaptchaV3 会被 WAF
+        判定为"刷 captcha"。限制并发数到 2 是经验值。
+        """
+        with self._captcha_slot_cv:
+            while self._captcha_in_flight >= self.MAX_CONCURRENT_CAPTCHAS:
+                self._captcha_slot_cv.wait(timeout=0.5)
+            self._captcha_in_flight += 1
+
+    def release_captcha_slot(self) -> None:
+        """释放 captcha 槽位。"""
+        with self._captcha_slot_cv:
+            self._captcha_in_flight = max(0, self._captcha_in_flight - 1)
+            self._captcha_slot_cv.notify_all()
+
+    def report_request_failure(self, kind: str, body: str = "", account_id: int = 0) -> None:
+        """汇报一次请求失败, 用于 IP 级别的集群失败检测。
+
+        限流类错误 (限流/verify_failed) 会:
+          1. 推入滑动窗口 (timestamp, account_id)
+          2. 统计**不同账号**数, ≥ 动态阈值才触发全局冷却 30 分钟
+             阈值 = max(3, active_count // 2), 避免多账号场景误杀
+             (单账号反复失败 = 账号问题, 不等于 IP 问题)
+
+        注意: verify_failed 在 classify_error 里被归到 "captcha_verify_param 失效或缺失",
+        kind 字符串里看不到, 必须从 body 二次判断。
+        """
+        # 限流类错误才计 cluster — kind + body 两个维度
+        is_rate_signal = (
+            "限流" in kind
+            or "verify_failed" in (body or "")
+            or "FRONTEND_CAPTCHA_REQUIRED" in (body or "")
+            or "F018" in (body or "")  # Aliyun WAF verify_failed 错误码
+        )
+        if not is_rate_signal:
+            return
+
+        with self._cluster_lock:
+            now = time.time()
+            self._cluster_failures.append((now, account_id))
+            # 60s 滑动窗口
+            cutoff = now - 60
+            self._cluster_failures = [
+                (t, aid) for (t, aid) in self._cluster_failures if t >= cutoff
+            ]
+
+            # 按"不同账号数"判定, 而不是"总失败次数"
+            unique_accounts = {aid for (_, aid) in self._cluster_failures if aid}
+            active_count = len(self.db.list_active_accounts())
+            threshold = max(3, active_count // 2)
+
+            if len(unique_accounts) >= threshold:
+                # 多账号同窗口内都被风控 → IP 级别问题
+                self.trigger_ip_cooldown(
+                    minutes=30,
+                    reason=f"60s 内 {len(unique_accounts)}/{active_count} 个账号触发限流",
+                )
+                # 重置窗口, 避免冷却期内反复触发
+                self._cluster_failures.clear()
+
+    def report_request_success(self) -> None:
+        """汇报一次请求成功, 清空 cluster 失败窗口。"""
+        with self._cluster_lock:
+            self._cluster_failures.clear()
 
     def resolve_account(self, session_id: Optional[str]) -> Optional[Account]:
         """根据 session_id 解析出要用的账号。

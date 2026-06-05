@@ -60,8 +60,7 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
         page.keyboard.press(ch)
         time.sleep(random.uniform(0.06, 0.18))
 
-    # "Thinking" pause — real users hesitate before clicking send
-    think = random.uniform(0.8, 2.5)
+    think = random.uniform(2.5, 5.0)
     print(f"[*] thinking {think:.2f}s before send", file=sys.stderr)
     time.sleep(think)
 
@@ -76,31 +75,49 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
             ) as resp_info:
                 if attempt == 0 and click_send:
                     # Curved mouse path to the send button, then real click
-                    btn_pos = page.evaluate("""() => {
-                        const btn = document.getElementById('send-message-button');
-                        if (!btn) throw new Error('send button not found');
-                        if (btn.disabled) throw new Error('send button still disabled');
-                        const r = btn.getBoundingClientRect();
-                        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-                    }""")
-                    tx, ty = btn_pos["x"], btn_pos["y"]
-                    # Pick a start point a bit away from current mouse position
-                    sx = ta_box["x"] + random.uniform(-20, 20)
-                    sy = ta_box["y"] + random.uniform(-20, 20)
-                    # 4 waypoints with perpendicular jitter for a curved path
-                    for step in range(1, 5):
-                        t = step / 4
-                        # Perpendicular jitter peaks at midpoint, zero at ends
-                        jit = 1 - abs(t - 0.5) * 2
-                        ox = random.uniform(-12, 12) * jit
-                        oy = random.uniform(-12, 12) * jit
-                        mx = sx + (tx - sx) * t + ox
-                        my = sy + (ty - sy) * t + oy
-                        page.mouse.move(mx, my, steps=4)
-                        time.sleep(random.uniform(0.02, 0.06))
-                    # Small hover pause over the button
-                    time.sleep(random.uniform(0.05, 0.18))
-                    page.mouse.click(tx, ty)
+                    # 修: button 可能暂时 disabled (React state 还没更新),
+                    # 等 1.5s 再点一次, 最多 3 次
+                    clicked = False
+                    for click_try in range(3):
+                        try:
+                            btn_pos = page.evaluate("""() => {
+                                const btn = document.getElementById('send-message-button');
+                                if (!btn) return null;
+                                if (btn.disabled) return { disabled: true };
+                                const r = btn.getBoundingClientRect();
+                                return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+                            }""")
+                            if btn_pos is None:
+                                raise RuntimeError("send button not found")
+                            if btn_pos.get("disabled"):
+                                print(f"[*] send button disabled, 等待 1.5s 后重试 ({click_try + 1}/3)", file=sys.stderr)
+                                time.sleep(1.5)
+                                continue
+                            tx, ty = btn_pos["x"], btn_pos["y"]
+                            # Pick a start point a bit away from current mouse position
+                            sx = ta_box["x"] + random.uniform(-20, 20)
+                            sy = ta_box["y"] + random.uniform(-20, 20)
+                            # 4 waypoints with perpendicular jitter for a curved path
+                            for step in range(1, 5):
+                                t = step / 4
+                                jit = 1 - abs(t - 0.5) * 2
+                                ox = random.uniform(-12, 12) * jit
+                                oy = random.uniform(-12, 12) * jit
+                                mx = sx + (tx - sx) * t + ox
+                                my = sy + (ty - sy) * t + oy
+                                page.mouse.move(mx, my, steps=4)
+                                time.sleep(random.uniform(0.02, 0.06))
+                            time.sleep(random.uniform(0.05, 0.18))
+                            page.mouse.click(tx, ty)
+                            clicked = True
+                            break
+                        except RuntimeError as e:
+                            if "not found" in str(e):
+                                raise  # 真的找不到, 不要再试
+                            print(f"[*] send button click 失败: {e}, 重试", file=sys.stderr)
+                            time.sleep(1.0)
+                    if not clicked:
+                        raise RuntimeError("send button 持续 disabled, 跳过 captcha")
 
             response = resp_info.value
             body = response.json()
@@ -466,6 +483,18 @@ class CaptchaSession:
             time.sleep(wait)
 
         page = self._context.new_page()
+        page.add_init_script(
+            "window.__nativeFetch = window.fetch.bind(window);"
+        )
+        # 关键: 屏蔽 chat.z.ai 前端抛出的未捕获异常,
+        # 否则 Playwright 的 FFPage._onUncaughtError 会因为 pageError.location
+        # 为 undefined 而整个 Node.js 进程崩溃。
+        def _swallow_page_error(err):
+            try:
+                print(f"[!] page error (swallowed): {err}", file=sys.stderr)
+            except Exception:
+                pass
+        page.on("pageerror", _swallow_page_error)
         try:
             page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("#chat-input", timeout=15000)
@@ -481,8 +510,25 @@ class CaptchaSession:
                 except Exception as e:
                     print(f"[!] fingerprint collection failed: {e}", file=sys.stderr)
                     self._fingerprint = None
-        finally:
-            page.close()
+        except Exception:
+            try:
+                page.close()
+            except Exception:
+                pass
+            raise
+
+        # Reuse the captcha page as the persistent fetch page. This makes the
+        # subsequent chat-completion request share the EXACT same page
+        # context (URL, referrer, document, React state) that produced the
+        # captcha — Aliyun WAF binds the captcha to all of these, so using
+        # a fresh page for the fetch causes verify_failed on attempt 0.
+        if self._fetch_page is not None:
+            try:
+                self._fetch_page.close()
+            except Exception:
+                pass
+        self._fetch_page = page
+        self._last_captcha_at = time.time()
 
         self._last_captcha_at = time.time()
 
@@ -519,9 +565,14 @@ class CaptchaSession:
                 self._fetch_page = None
 
         page = self._context.new_page()
+        # Capture native fetch BEFORE chat.z.ai's React wrapper installs.
+        # addInitScript runs in the page context before any document scripts.
+        page.add_init_script(
+            "window.__nativeFetch = window.fetch.bind(window);"
+        )
         page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
         self._fetch_page = page
-        print(f"[*] Persistent fetch page ready.", file=sys.stderr)
+        print(f"[*] Persistent fetch page ready (native fetch captured).", file=sys.stderr)
         return page
 
     def fetch(self, url: str, headers: dict, body: str) -> dict:
@@ -567,17 +618,21 @@ class CaptchaSession:
             }''', [url, headers, body])
 
     def fetch_streaming(self, url: str, headers: dict, body: str):
-        """Streaming fetch: yield {status, chunk, done, error} dicts.
+        """Streaming fetch via page.evaluate(native fetch).
 
-        The initial JS setup runs on the worker thread. Then we poll from the
-        calling thread — page.evaluate for polling is safe because it only
-        reads a JS global (no greenlet-sensitive operations).
+        Two changes vs the previous implementation:
+        1. Save a reference to native fetch on first call (before any
+           chat.z.ai React wrapper is applied) and use that for all
+           subsequent calls. The wrapper we observed only forces an
+           x-region header, but bypassing it removes one variable.
+        2. Capture resp.status / content-type / hasBody into the buffer
+           and surface them in the polled dict, so failures surface as
+           actionable errors instead of a silent "no chunks" hang.
         """
-        # Start the JS streaming fetch on the worker thread
+        # Start the JS streaming fetch on the worker thread (page is owned there)
         self._run_on_worker(self._start_streaming_fetch, url, headers, body)
 
-        # Poll from the calling thread (page.evaluate for polling is safe —
-        # it just reads a JS global array, no navigation or page creation)
+        # Poll buffer from the worker thread
         while True:
             items = self._run_on_worker(self._poll_stream_buffer)
 
@@ -589,22 +644,40 @@ class CaptchaSession:
                     raise RuntimeError(items["error"])
                 break
 
-            time.sleep(0.05)  # 50ms 轮询间隔
+            time.sleep(0.05)
 
     def _start_streaming_fetch(self, url: str, headers: dict, body: str):
         page = self.get_fetch_page()
         page.evaluate('''([url, headers, body]) => {
+            // Save native fetch on first call so future calls bypass any
+            // chat.z.ai React wrapper (window.fetch may be replaced later).
+            if (!window.__nativeFetch) {
+                window.__nativeFetch = window.fetch.bind(window);
+            }
             window.__stream_buf = [];
             window.__stream_done = false;
             window.__stream_error = null;
+            window.__stream_status = null;
             (async () => {
                 try {
-                    const resp = await fetch(url, {
+                    const resp = await window.__nativeFetch(url, {
                         method: "POST",
                         headers: headers,
                         body: body,
                     });
-                    window.__stream_buf.push({status: resp.status, type: "status"});
+                    window.__stream_status = resp.status;
+                    window.__stream_buf.push({
+                        status: resp.status,
+                        type: "status",
+                        contentType: resp.headers.get("content-type") || "",
+                        hasBody: !!resp.body,
+                    });
+
+                    if (!resp.body) {
+                        window.__stream_error = "resp.body is null (status=" + resp.status + ")";
+                        window.__stream_done = true;
+                        return;
+                    }
 
                     const reader = resp.body.getReader();
                     const decoder = new TextDecoder();
@@ -637,7 +710,7 @@ class CaptchaSession:
                     flush();
                     window.__stream_done = true;
                 } catch(e) {
-                    window.__stream_error = e.message;
+                    window.__stream_error = (e && e.message) || String(e);
                     window.__stream_done = true;
                 }
             })();
@@ -652,6 +725,7 @@ class CaptchaSession:
                 items: buf,
                 done: window.__stream_done || false,
                 error: window.__stream_error || null,
+                status: window.__stream_status,
             };
         }''')
 
