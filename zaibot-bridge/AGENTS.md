@@ -106,3 +106,54 @@ Z.ai 不原生支持 OpenAI 的 tools 字段，所以使用 DSML 协议将工具
 | 签名/反爬 | X-Signature (已还原) | 无需签名 |
 | Captcha | Camoufox 自动获取 | 无需 captcha |
 | 端口 | 8001 | 8000 |
+
+## 请求处理流程
+
+```
+POST /v1/chat/completions
+  → normalize_request()          标准化为 InternalRequest
+  → resolve_model()              解析模型别名
+  → runtime.execute()            核心执行 (async generator)
+    → flatten_messages()         消息 → prompt 字符串
+    → resolve_account()          session_id → 账号 (粘性绑定)
+    → check_ip_cooldown()        全局风控检查
+    → acquire_ip_slot()          全局请求间隔 (1s)
+    → do_request_sync()          [线程池执行]
+      → get_signature()          HMAC 签名 (或 captured fallback)
+      → create_chat()            创建/复用 chat_id
+      → get_captcha()            Camoufox 获取验证码
+      → build_body/headers       构建请求
+      → Pure HTTP 或 DOM Fetch   发送到 Z.ai
+      → SSE 解析                 thinking/answer/tool_call
+    → to_sse_stream()            转换为 OpenAI SSE 格式
+  → StreamingResponse            返回客户端
+```
+
+## 常见问题排查
+
+### 服务启动后立即崩溃
+1. 检查端口占用: `lsof -ti :8001 | xargs kill`
+2. 检查 Python 版本: 需要 3.10+
+3. 直接运行看报错: `../.venv/bin/python3 server.py`
+
+### 请求返回空 content
+最常见原因链:
+1. **签名失败** → 日志显示 "没有可用 X-Signature"
+   - 修复: 设置 `ZAIBOT_HMAC_SECRET` 或更新 `captured_request.json`
+2. **Captcha 失败** → 日志显示 "captcha 生成失败"
+   - 修复: 检查 `import queue` 是否缺失
+3. **限流** → 日志显示 "IP 级别风控冷却中"
+   - 修复: 等待冷却或检查账号状态
+
+### 日志查看
+```bash
+# 手动启动时日志输出到 stdout
+ZAIBOT_USE_PURE_HTTP=1 ../.venv/bin/python3 server.py 2>&1 | tee /tmp/zaibot_server.log
+
+# 关键日志模式
+grep "Request attempt" /tmp/zaibot_server.log    # 请求开始
+grep "Created new chat_id" /tmp/zaibot_server.log # 会话创建
+grep "captcha" /tmp/zaibot_server.log            # 验证码流程
+grep "Path:" /tmp/zaibot_server.log              # HTTP 路径选择
+grep "WARNING\|ERROR" /tmp/zaibot_server.log     # 错误信息
+```
