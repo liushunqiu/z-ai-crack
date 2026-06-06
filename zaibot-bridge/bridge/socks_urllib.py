@@ -87,14 +87,18 @@ def make_opener(proxy: Optional[str]) -> urllib.request.OpenerDirector:
       - http://host:port (urllib ProxyHandler)
       - https://host:port (urllib ProxyHandler)
     """
+    # 显式空 ProxyHandler 阻止 build_opener 注入 macOS 系统代理
+    # (macOS 上 urllib.request.getproxies() 会读 networksetup, 不读 env)
+    NO_PROXY = urllib.request.ProxyHandler({})
+
     if not proxy:
-        return urllib.request.build_opener()
+        return urllib.request.build_opener(NO_PROXY)
 
     scheme, host, port, user, pw = _parse_proxy(proxy)
 
     if scheme.startswith("socks"):
         factory = _make_socks5_connection(host, port, user, pw)
-        return urllib.request.build_opener(SOCKS5HTTPSHandler(factory))
+        return urllib.request.build_opener(NO_PROXY, SOCKS5HTTPSHandler(factory))
 
     if scheme in ("http", "https"):
         # urllib ProxyHandler 走 CONNECT 隧道 (HTTPS 目标)
