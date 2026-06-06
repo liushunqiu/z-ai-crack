@@ -7,7 +7,6 @@ without Playwright/Camoufox once login/signature/captcha material is available.
 from __future__ import annotations
 
 import base64
-import dataclasses
 import hashlib
 import hmac
 import json
@@ -270,17 +269,6 @@ def sign_with_secret(secret: str, prompt: str, timestamp: str, request_id: str, 
     prompt_b64 = base64.b64encode(prompt.encode()).decode()
     message = f"{sorted_payload(timestamp, request_id, user_id)}|{prompt_b64}|{timestamp}"
     return hmac.new(key_hex.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-
-def _request_signature_from_server(prompt: str) -> Optional[Dict[str, str]]:
-    """Optional stdin/stdout helper hook.
-
-    If ZAIBOT_SIGNATURE_CMD is set, it is executed as a long-running command is
-    intentionally NOT handled here; this stdlib client instead reads cache files.
-    See signature_server.py for browser-backed capture. This function is kept as
-    an extension point without adding subprocess lifecycle complexity here.
-    """
-    return None
 
 
 def load_latest_captured_signature() -> Optional[Dict[str, str]]:

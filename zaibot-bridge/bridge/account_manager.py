@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 import time
 import urllib.request
@@ -690,11 +689,6 @@ class AccountManager:
             ids = list(self._sessions.keys())
         for aid in ids:
             self._close_session(aid)
-
-    def account_session_status(self) -> dict[int, str]:
-        """返回每个账号的浏览器状态。"""
-        with self._session_lock:
-            return {aid: "running" for aid in self._sessions.keys()}
 
     def mark_request(
         self,

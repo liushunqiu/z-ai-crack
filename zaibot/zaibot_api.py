@@ -36,7 +36,6 @@ from zaibot_core import (
     ZaibotHTTPError,
     classify_error,
     is_retriable_error,
-    load_captcha_cache,
     post_chat,
 )
 
@@ -116,7 +115,7 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
     return captcha
 
 
-def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser: bool = False, allow_stale_signature: bool = False, with_captcha: bool = False, captcha_session=None, chat_session: ChatSession | None = None, max_retries: int = 2) -> str:
+def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser: bool = False, allow_stale_signature: bool = False, captcha_session=None, chat_session: ChatSession | None = None, max_retries: int = 2) -> str:
     """Send a prompt to the API.
 
     Args:
@@ -224,7 +223,6 @@ def interactive(args: argparse.Namespace) -> None:
                     stream=not args.no_stream,
                     no_browser=args.no_browser,
                     allow_stale_signature=args.allow_stale_signature,
-                    with_captcha=args.with_captcha,
                     captcha_session=captcha_sess,
                     chat_session=chat_sess,
                 )
@@ -263,7 +261,6 @@ def _single_shot(prompt: str, args: argparse.Namespace) -> int:
             stream=not args.no_stream,
             no_browser=args.no_browser,
             allow_stale_signature=args.allow_stale_signature,
-            with_captcha=args.with_captcha,
             captcha_session=captcha_sess,
             chat_session=chat_sess,
         )
@@ -283,7 +280,6 @@ def main() -> int:
     ap.add_argument("--no-stream", action="store_true", help="request non-stream response")
     ap.add_argument("--no-browser", action="store_true", help="never open browser for captcha fallback")
     ap.add_argument("--no-headless", action="store_true", help="run browser in visible mode (more stable captcha)")
-    ap.add_argument("--with-captcha", action="store_true", help="include cached captcha on first attempt if available")
     ap.add_argument("--allow-stale-signature", action="store_true", help="allow stale captured_request signature fallback")
     ap.add_argument("--chat-id", default=None, help="continue an existing chat by ID")
     args = ap.parse_args()

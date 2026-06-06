@@ -11,7 +11,6 @@ import logging
 
 import base64
 import json
-import queue
 import sys
 import time
 from pathlib import Path
@@ -406,20 +405,6 @@ class CaptchaSession:
         self._context = self._browser.new_context(storage_state=state)
         _logger.info(f"[*] Persistent browser ready (account={self.account_name}).")
 
-    def interactive_login(self, *, on_progress=None) -> bool:
-        """Headful login flow: open chat.z.ai and wait for user to complete login.
-
-        Returns True on success (token captured in localStorage), False otherwise.
-        Calls on_progress(status: str) for UI feedback.
-
-        The browser stays open and persistent so subsequent captcha calls can
-        reuse it. Must be called after start().
-        """
-        if not self._context:
-            raise RuntimeError("Session not started. Call start() first.")
-
-        return self._run_on_worker(self._interactive_login_impl, on_progress)
-
     def _interactive_login_impl(self, on_progress) -> bool:
         page = self._context.new_page()
         try:
@@ -465,10 +450,6 @@ class CaptchaSession:
         Runs on the dedicated worker thread.
         """
         return self._run_on_worker(self._get_captcha_impl, save)
-
-    def get_fingerprint(self) -> Optional[dict]:
-        """Return the cached browser fingerprint (collected on first captcha call)."""
-        return self._fingerprint
 
     def _get_captcha_impl(self, save: bool) -> Tuple[str, dict]:
         if not self._context:
@@ -531,8 +512,6 @@ class CaptchaSession:
             except Exception:
                 pass
         self._fetch_page = page
-        self._last_captcha_at = time.time()
-
         self._last_captcha_at = time.time()
 
         raw, param_obj = _build_captcha_raw(certify_id, security_token)
