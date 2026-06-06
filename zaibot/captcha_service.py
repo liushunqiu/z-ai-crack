@@ -380,6 +380,14 @@ class CaptchaSession:
             "geoip": False,
         }
 
+        # 代理支持：绕过 IP 级 WAF 封禁
+        import os
+        proxy_url = os.environ.get("ZAIBOT_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if proxy_url:
+            config["proxy"] = {"server": proxy_url}
+            config["geoip"] = True
+            _logger.info(f"[*] Using proxy: {proxy_url} (geoip=True)")
+
         # 根据账号标识生成不同的指纹配置
         if self.account_id:
             # 使用 account_id 的哈希值来生成不同的配置

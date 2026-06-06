@@ -33,6 +33,21 @@ from fastapi.security import APIKeyHeader
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# SOCKS5 代理：配置 urllib 全局走代理（绕过 IP 级 WAF）
+_zaibot_proxy = os.environ.get("ZAIBOT_PROXY", "")
+if _zaibot_proxy.startswith("socks5"):
+    try:
+        import socks as _socks
+        import socket as _socket
+        # 解析 socks5://host:port
+        _proxy_addr = _zaibot_proxy.replace("socks5://", "").replace("socks5h://", "")
+        _proxy_host, _proxy_port = _proxy_addr.rsplit(":", 1)
+        _socks.set_default_proxy(_socks.SOCKS5, _proxy_host, int(_proxy_port))
+        _socket.socket = _socks.socksocket
+        print(f"[proxy] urllib 全局 SOCKS5: {_proxy_host}:{_proxy_port}")
+    except ImportError:
+        print("[proxy] pysocks 未安装，urllib 无法使用 SOCKS5 代理")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

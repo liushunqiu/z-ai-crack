@@ -49,7 +49,7 @@ Sibling imports between `zaibot/` and `zaibot-bridge/` are done via `sys.path.in
 - **Sticky binding**: `session_id` in API requests maps permanently to one Z.ai account via round-robin on first use. Changing the binding resets the conversation (`chat_id`).
 - **Captcha tokens are single-use**: Every chat completion request mints a fresh captcha token via per-account Camoufox browser.
 - **IP-level rate limiting**: `AccountManager` enforces a global cooldown across all accounts when multiple accounts fail in a short window.
-- **Pure HTTP vs DOM Fetch**: `ZAIBOT_USE_PURE_HTTP=1` 走 urllib，但 captcha token 与浏览器指纹绑定，Pure HTTP 路径下 captcha 大概率被拒（`FRONTEND_CAPTCHA_REQUIRED`）。**必须用 DOM Fetch 路径**（默认）。
+- **Pure HTTP vs DOM Fetch**: 默认 DOM Fetch 路径在无代理时可用。但使用代理时，**必须用 Pure HTTP + SOCKS5**（`ZAIBOT_USE_PURE_HTTP=1` + `ZAIBOT_PROXY=socks5://...`），让 urllib 和 Camoufox 浏览器从同一代理 IP 出去，否则 captcha 指纹绑定不匹配。DOM Fetch 路径下浏览器 `__nativeFetch` 会被 Aliyun WAF 拦截（405）。
 
 ## 风控规避策略（实测验证）
 
@@ -65,28 +65,54 @@ Sibling imports between `zaibot/` and `zaibot-bridge/` are done via `sys.path.in
 
 ### 实测数据（2026-06-06）
 
-连续对话测试，单账号，15s 请求间隔：
+**测试 A: 无代理 + DOM Fetch（失败）**
+
+连续对话，单账号，15s 间隔：
 
 | 轮次 | 耗时 | 结果 | 备注 |
 |------|------|------|------|
 | 1 | 14.3s | OK | 首轮创建 chat_id |
-| 2 | 22.2s | OK | captcha 重试 1 次（verify_failed），chat_id 复用 |
+| 2 | 22.2s | OK | captcha 重试 1 次 |
 | 3 | 9.6s | OK | 一次通过 |
-| 4 | 35.8s | 失败 | captcha 被拒 → 重试 → HTTP 405 → 30min IP 冷却 |
+| 4 | 35.8s | 失败 | WAF 405 → 30min IP 冷却 |
 
-**结论**: 单账号安全窗口约 3 次请求（~60s 内），之后 WAF 开始拦截。
+**测试 B: Pure HTTP + SOCKS5 代理（成功）**
+
+```bash
+ZAIBOT_USE_PURE_HTTP=1 ZAIBOT_PROXY=socks5://127.0.0.1:33211 python3 server.py
+```
+
+| 轮次 | 耗时 | 结果 | 备注 |
+|------|------|------|------|
+| 1 | 24.0s | OK | 首轮创建 chat_id |
+| 2 | 10.7s | OK | 记忆验证：正确回答「小明」 |
+| 3 | 33.3s | OK | 记忆验证：正确回答「火锅」 |
+| 4 | 15.7s | OK | 长文本：火锅诗 |
+| 5 | 23.9s | OK | 完整对话总结 |
+
+**结论**: 无代理时单账号约 3 次后 WAF 拦截。使用 Pure HTTP + SOCKS5 代理可稳定 5+ 轮对话，零 WAF 错误。
 
 ### 推荐配置
 
-**单账号场景（保守）：**
+**最佳方案（Pure HTTP + SOCKS5 代理）：**
+```bash
+cd zaibot-bridge
+ZAIBOT_USE_PURE_HTTP=1 ZAIBOT_PROXY=socks5://127.0.0.1:你的SOCKS5端口 ../.venv/bin/python3 server.py
+```
+- Camoufox 浏览器走 SOCKS5 代理获取 captcha（geoip=True 自动匹配指纹）
+- urllib 通过 pysocks 全局走同一 SOCKS5 代理
+- 所有请求从同一代理 IP 出去，captcha 指纹绑定匹配
+- 需要安装: `pip install pysocks` 和 `pip install camoufox[geoip]`
+
+**无代理场景（仅限低频率使用）：**
 - 请求间隔 ≥ 30 秒
 - 每小时不超过 10 次请求
-- verify_failed 退避 ≥ 60 秒
+- 使用默认 DOM Fetch 路径（不设置 `ZAIBOT_USE_PURE_HTTP`）
 
-**多账号场景（推荐 ≥ 3 个账号）：**
+**多账号场景（推荐 ≥ 3 个账号 + 代理）：**
 - 每账号间隔 ≥ 30 秒
 - 全局间隔 ≥ 10 秒（不同账号轮换）
-- 使用代理轮换 IP（每账号绑定一个出口 IP）
+- 每账号绑定不同代理出口 IP
 
 **已实现的自动保护：**
 - `verify_failed` 退避：30s → 90s（`runtime.py`，修复前为 5s → 10s）
