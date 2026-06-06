@@ -323,7 +323,7 @@ class CaptchaSession:
         # interaction — combined with the throttle, actual inter-captcha
         # gap is ~5.6-9s, which keeps us under Aliyun's behavior threshold.
         # Tune via set_captcha_rate_limit() at runtime if needed.
-        self._min_captcha_interval = 4.0
+        self._min_captcha_interval = 6.0
         self._last_captcha_at = 0.0
         # Dedicated thread for ALL Playwright operations
         self._worker_thread: threading.Thread | None = None

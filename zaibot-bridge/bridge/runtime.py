@@ -275,8 +275,8 @@ class ChatRuntimeService:
                                     # verify_failed / FRONTEND_CAPTCHA_REQUIRED 视为 IP 限流信号:
                                     # 重试等于送死, 直接退避
                                     if "verify_failed" in err_str or "FRONTEND_CAPTCHA_REQUIRED" in err_str:
-                                        backoff = 5 * (2 ** attempt)
-                                        _logger.warning("verify_failed -> backoff %ds before retry", backoff)
+                                        backoff = 30 * (3 ** attempt)
+                                        _logger.warning("verify_failed -> backoff %ds before retry (WAF cooldown)", backoff)
                                         time.sleep(backoff)
                                     _logger.info("Retriable error, retry with chat_id %s", "kept" if session.chat_id else "reset")
                                     retriable_sse_error = True

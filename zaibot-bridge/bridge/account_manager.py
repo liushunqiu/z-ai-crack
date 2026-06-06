@@ -17,7 +17,7 @@ from pathlib import Path
 
 from zaibot.captcha_service import CaptchaSession
 
-from .db import Account, AccountDB  # noqa: E402
+from .db import Account, AccountDB, account_to_public_dict  # noqa: E402
 from . import config  # noqa: E402
 from .rate_limiter import RateLimiter  # noqa: E402
 

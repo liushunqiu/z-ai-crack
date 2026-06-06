@@ -49,6 +49,62 @@ Sibling imports between `zaibot/` and `zaibot-bridge/` are done via `sys.path.in
 - **Sticky binding**: `session_id` in API requests maps permanently to one Z.ai account via round-robin on first use. Changing the binding resets the conversation (`chat_id`).
 - **Captcha tokens are single-use**: Every chat completion request mints a fresh captcha token via per-account Camoufox browser.
 - **IP-level rate limiting**: `AccountManager` enforces a global cooldown across all accounts when multiple accounts fail in a short window.
+- **Pure HTTP vs DOM Fetch**: `ZAIBOT_USE_PURE_HTTP=1` 走 urllib，但 captcha token 与浏览器指纹绑定，Pure HTTP 路径下 captcha 大概率被拒（`FRONTEND_CAPTCHA_REQUIRED`）。**必须用 DOM Fetch 路径**（默认）。
+
+## 风控规避策略（实测验证）
+
+### Z.ai 风控层级
+
+| 层级 | 触发条件 | 后果 | 恢复方式 |
+|------|---------|------|---------|
+| Captcha 质量 | Aliyun 行为评分低 | `FRONTEND_CAPTCHA_REQUIRED` | 等 30s+ 重试 |
+| IP 级 WAF | 短时间内多次 captcha 失败 | HTTP 405 (Aliyun WAF 页面) | 换 IP 或等数小时 |
+| 账号冷却 | 单账号触发 WAF | 该账号 30min 不可用 | 等待自动恢复 |
+| 全局 IP 冷却 | 任一账号触发 WAF | 所有账号 30min 暂停 | 重启服务清内存 + 等 DB 冷却过期 |
+| 账号自动禁用 | 1h 内 3+ 限流错误 | 账号永久 disabled | 手动重新登录 |
+
+### 实测数据（2026-06-06）
+
+连续对话测试，单账号，15s 请求间隔：
+
+| 轮次 | 耗时 | 结果 | 备注 |
+|------|------|------|------|
+| 1 | 14.3s | OK | 首轮创建 chat_id |
+| 2 | 22.2s | OK | captcha 重试 1 次（verify_failed），chat_id 复用 |
+| 3 | 9.6s | OK | 一次通过 |
+| 4 | 35.8s | 失败 | captcha 被拒 → 重试 → HTTP 405 → 30min IP 冷却 |
+
+**结论**: 单账号安全窗口约 3 次请求（~60s 内），之后 WAF 开始拦截。
+
+### 推荐配置
+
+**单账号场景（保守）：**
+- 请求间隔 ≥ 30 秒
+- 每小时不超过 10 次请求
+- verify_failed 退避 ≥ 60 秒
+
+**多账号场景（推荐 ≥ 3 个账号）：**
+- 每账号间隔 ≥ 30 秒
+- 全局间隔 ≥ 10 秒（不同账号轮换）
+- 使用代理轮换 IP（每账号绑定一个出口 IP）
+
+**已实现的自动保护：**
+- `verify_failed` 退避：30s → 90s（`runtime.py`，修复前为 5s → 10s）
+- Captcha 最小间隔：6s（`captcha_service.py`，修复前为 4s）
+- 全局请求间隔：1s（`config.py:GLOBAL_MIN_INTERVAL`）
+- 单账号请求间隔：2s（`config.py:MIN_REQUEST_INTERVAL`）
+- 集群故障检测：60s 内半数账号失败 → 30min 全局冷却
+
+### 被 IP 封禁后的恢复步骤
+
+1. 等待数小时（Aliyun WAF 通常 1-4 小时自动解除）
+2. 或切换到代理 IP
+3. 重启服务清除内存中的冷却状态
+4. 清除 DB 中的账号冷却：
+```bash
+sqlite3 zaibot-bridge/data/accounts.db "UPDATE accounts SET status='active', cooldown_until=0 WHERE status='cooldown';"
+```
+5. 用更长间隔重新测试
 
 ## Troubleshooting Runbook
 
@@ -113,8 +169,8 @@ import queue
 print('All imports OK')
 "
 
-# 2. 启动服务
-ZAIBOT_USE_PURE_HTTP=1 ../.venv/bin/python3 server.py &
+# 2. 启动服务 (默认使用 DOM Fetch 路径)
+../.venv/bin/python3 server.py &
 sleep 3
 
 # 3. 检查状态
