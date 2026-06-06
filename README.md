@@ -12,7 +12,7 @@ z-ai-crack/
 ├── zaibot/                      # Z.ai 核心 API 客户端
 │   ├── zaibot_core.py           # HTTP 核心：签名、请求构造、SSE 解析
 │   ├── zaibot_api.py            # CLI 入口：交互/单条模式
-│   ├── captcha_service.py       # Camoufox 验证码服务 (CaptchaSession + interactive_login)
+│   ├── captcha_service.py       # Camoufox 验证码服务 (CaptchaSession, worker 线程隔离)
 │   ├── login.py                 # 登录、session 保存
 │   └── tools/                   # 调试/分析工具
 │
@@ -176,6 +176,9 @@ runtime.execute()                         核心执行 (async generator)
 | `/admin/api/accounts` | GET / POST | 列出 / 创建账号 |
 | `/admin/api/accounts/{id}` | PATCH / DELETE | 修改状态（启停） / 删除 |
 | `/admin/api/accounts/{id}/login` | POST | 触发 headful 登录（SSE 进度推送） |
+| `/admin/api/accounts/{id}/test` | POST | 测试账号可用性 |
+| `/admin/api/accounts/{id}/reset` | POST | 重置账号状态 |
+| `/admin/api/accounts/{id}/cooldown` | GET | 查看账号冷却状态 |
 | `/admin/api/bindings` | GET | 列出所有会话绑定 |
 | `/admin/api/bindings/{sid}` | GET / PATCH / DELETE | 查询 / 改绑 / 解绑会话 |
 | `/admin/api/resolve` | GET | 预览：某 session_id 会绑到哪个账号 |
@@ -315,7 +318,7 @@ data/
 ├── accounts.db              # SQLite: 账号 + 绑定 + 事件
 └── accounts/
     ├── alice/
-    │   └── state.json       # Playwright storage_state (cookies + localStorage)
+    │   └── state.json       # Camoufox storage_state (cookies + localStorage)
     ├── bob/
     │   └── state.json
     └── charlie/
