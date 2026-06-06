@@ -8,6 +8,7 @@ Returns captcha_verify_param (base64-encoded JSON with certifyId, sceneId, isSig
 """
 from __future__ import annotations
 import logging
+import queue
 
 import base64
 import json

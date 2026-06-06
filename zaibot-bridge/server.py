@@ -29,8 +29,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 
-# 将 bridge 目录加入 path
+# 将 bridge 目录和项目根目录加入 path
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 logging.basicConfig(
     level=logging.INFO,

@@ -23,6 +23,7 @@ import urllib.request
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 from typing import AsyncIterator, Iterator
 
 from .models import (
