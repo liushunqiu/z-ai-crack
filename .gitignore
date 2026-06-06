@@ -26,3 +26,4 @@ zaibot/hmac_secret.json
 
 # Multi-account bridge data (contains per-account storage state with cookies)
 zaibot-bridge/data/
+*.egg-info/

@@ -1,0 +1,4 @@
+{
+  "update_plan": "IMPORTANT: After calling update_plan, the plan is already shown to the user in the UI. You MUST immediately proceed to execute step 1 via another tool call in the SAME response. Do NOT restate, summarize, or describe the plan in natural language. Do NOT ask the user to confirm before proceeding.",
+  "apply_patch": "Use apply_patch to edit existing files. Provide unified diff format in the 'patch' parameter. Do NOT use sed, awk, or Bash commands to edit files."
+}

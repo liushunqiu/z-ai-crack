@@ -59,7 +59,7 @@ def detect_fe_version(*, timeout: int = 10, max_age_hours: float = 24) -> str:
             if cached and time.time() - ts < max_age_hours * 3600:
                 _FE_VERSION_CACHE = cached
                 return cached
-        except Exception:
+        except (json.JSONDecodeError, OSError, ValueError):
             pass
 
     # Fetch from live page
@@ -76,10 +76,10 @@ def detect_fe_version(*, timeout: int = 10, max_age_hours: float = 24) -> str:
                     json.dumps({"version": version, "timestamp": time.time()}),
                     encoding="utf-8",
                 )
-            except Exception:
+            except (OSError, PermissionError):
                 pass
             return version
-    except Exception:
+    except (urllib.error.URLError, TimeoutError, OSError):
         pass
 
     _FE_VERSION_CACHE = fallback
@@ -149,7 +149,7 @@ def _read_state_local_storage(name: str) -> str:
                 for item in origin.get("localStorage", []):
                     if item.get("name") == name:
                         return item.get("value") or ""
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return ""
     return ""
 
@@ -165,7 +165,7 @@ def _read_state_local_storage_from(name: str, state_path: Path) -> str:
                 for item in origin.get("localStorage", []):
                     if item.get("name") == name:
                         return item.get("value") or ""
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return ""
     return ""
 
@@ -177,7 +177,7 @@ def read_token() -> str:
     if state_token:
         try:
             TOKEN_FILE.write_text(state_token, encoding="utf-8")
-        except Exception:
+        except (OSError, PermissionError):
             pass
         return state_token
     if not TOKEN_FILE.exists():
@@ -192,7 +192,7 @@ def get_user_id(token: str) -> str:
     try:
         parts = token.split(".")
         return json.loads(_b64url_decode(parts[1])).get("id", "")
-    except Exception:
+    except (IndexError, KeyError, json.JSONDecodeError, ValueError):
         return ""
 
 
@@ -202,7 +202,7 @@ def get_user_name(default: str = "") -> str:
         if raw:
             user = json.loads(raw)
             return user.get("name") or default
-    except Exception:
+    except (json.JSONDecodeError, KeyError):
         return default
     return default
 
@@ -250,9 +250,6 @@ def sorted_payload(timestamp: str, request_id: str, user_id: str) -> str:
     """
     payload = {"requestId": request_id, "timestamp": timestamp, "user_id": user_id}
     return ",".join(f"{k},{payload[k]}" for k in sorted(payload))
-
-
-DEFAULT_HMAC_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 
 
 def sign_with_secret(secret: str, prompt: str, timestamp: str, request_id: str, user_id: str) -> str:
@@ -334,18 +331,20 @@ def save_signature_cache(signature: str, signature_timestamp: str, source: str =
 
 
 def get_signature(prompt: str, timestamp: str, request_id: str, user_id: str, *, allow_stale: bool = False) -> Tuple[str, str, str]:
-    secret = os.environ.get("ZAIBOT_HMAC_SECRET", DEFAULT_HMAC_SECRET).strip()
+    secret = os.environ.get("ZAIBOT_HMAC_SECRET", "").strip()
     if secret:
         return sign_with_secret(secret, prompt, timestamp, request_id, user_id), timestamp, "local_hmac_secret"
 
-    # Normally unreachable because DEFAULT_HMAC_SECRET is bundled, but keep
-    # cache fallback for quick diff/debug if the frontend rotates the secret.
+    # Fallback to cache for diff/debug if the frontend rotates the secret.
     max_age = 0 if allow_stale else 300
     cached = load_signature_cache(max_age_seconds=max_age)
     if cached:
         return cached["signature"], cached["signature_timestamp"], cached.get("source", "cache")
 
-    raise ZaibotError("没有可用 X-Signature，且本地 secret 为空")
+    raise ZaibotError(
+        "没有可用 X-Signature: 请设置环境变量 ZAIBOT_HMAC_SECRET，"
+        "或确保签名缓存文件存在且未过期。"
+    )
 
 
 def load_captcha_cache(max_age_seconds: int = 240) -> Optional[str]:

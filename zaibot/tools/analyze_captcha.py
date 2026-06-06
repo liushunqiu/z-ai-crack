@@ -7,6 +7,10 @@ import json
 import time
 from pathlib import Path
 from camoufox import Camoufox, DefaultAddons
+import logging
+
+_logger = logging.getLogger(__name__)
+
 
 STATE_FILE = Path(__file__).parent / "zaibot_state.json"
 OUTPUT_FILE = Path(__file__).parent / "captcha_analysis.json"
@@ -46,9 +50,9 @@ def analyze():
                     "timestamp": time.time(),
                 }
                 captured["requests"].append(data)
-                print(f"[REQ] {request.method} {url[:120]}")
+                _logger.info(f"[REQ] {request.method} {url[:120]}")
                 if request.post_data:
-                    print(f"  Body: {request.post_data[:200]}")
+                    _logger.info(f"  Body: {request.post_data[:200]}")
 
         def handle_response(response):
             url = response.url
@@ -66,9 +70,9 @@ def analyze():
                     "timestamp": time.time(),
                 }
                 captured["requests"].append({"response": data})
-                print(f"[RESP] {response.status} {url[:120]}")
+                _logger.info(f"[RESP] {response.status} {url[:120]}")
                 if body and len(body) < 500:
-                    print(f"  Body: {body[:200]}")
+                    _logger.info(f"  Body: {body[:200]}")
 
         page.on("request", handle_request)
         page.on("response", handle_response)
@@ -127,12 +131,12 @@ def analyze():
         send_btn = page.query_selector("#send-message-button")
         if send_btn and not send_btn.is_disabled():
             send_btn.click()
-            print("[*] Message sent, waiting for captcha...")
+            _logger.info("[*] Message sent, waiting for captcha...")
 
-        print("=" * 60)
-        print("  Please solve the captcha in the browser")
-        print("  The script will capture all network traffic")
-        print("=" * 60)
+        _logger.info("=" * 60)
+        _logger.info("  Please solve the captcha in the browser")
+        _logger.info("  The script will capture all network traffic")
+        _logger.info("=" * 60)
 
         # Wait for captcha to be solved and request to complete
         for i in range(180):
@@ -142,13 +146,14 @@ def analyze():
             chat_reqs = [r for r in captured["requests"]
                         if isinstance(r, dict) and "chat/completions" in r.get("url", "")]
             if chat_reqs:
-                print(f"\n[+] Chat request captured at {i*2}s!")
+                _logger.info(f"\n[+] Chat request captured at {i*2}s!")
                 break
 
             if i % 15 == 0:
-                print(f"  [{i*2}s] waiting...")
+                _logger.info(f"  [{i*2}s] waiting...")
 
         # Get captcha verify params from page context
+
         verify_params = page.evaluate("window.__captchaVerifyParams || []")
         captcha_success = page.evaluate("window.__captchaSuccess || []")
 
@@ -158,10 +163,10 @@ def analyze():
         # Save results
         with open(OUTPUT_FILE, "w") as f:
             json.dump(captured, f, indent=2, ensure_ascii=False)
-        print(f"\n[+] Analysis saved to {OUTPUT_FILE}")
-        print(f"  Total requests captured: {len(captured['requests'])}")
-        print(f"  Verify params: {len(verify_params)}")
-        print(f"  Captcha success: {len(captcha_success)}")
+        _logger.info(f"\n[+] Analysis saved to {OUTPUT_FILE}")
+        _logger.info(f"  Total requests captured: {len(captured['requests'])}")
+        _logger.info(f"  Verify params: {len(verify_params)}")
+        _logger.info(f"  Captcha success: {len(captcha_success)}")
 
 
 if __name__ == "__main__":

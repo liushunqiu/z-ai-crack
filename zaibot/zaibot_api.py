@@ -22,6 +22,7 @@ Captcha sources:
   2. if server says captcha is required and browser is allowed, call get_captcha.py logic
 """
 from __future__ import annotations
+import logging
 
 import argparse
 import sys
@@ -39,6 +40,8 @@ from zaibot_core import (
     post_chat,
 )
 
+
+_logger = logging.getLogger(__name__)
 
 def _try_protocol_captcha() -> str | None:
     """Try the no-browser captcha minting path.
@@ -61,11 +64,11 @@ def _try_protocol_captcha() -> str | None:
             if raw and not raw.startswith("{"):
                 return raw
         if proc.stderr:
-            print(f"[*] 纯协议验证码暂不可用: {proc.stderr.strip().splitlines()[-1]}", file=sys.stderr)
+            _logger.info(f"[*] 纯协议验证码暂不可用: {proc.stderr.strip().splitlines()[-1]}")
     except FileNotFoundError:
-        print("[*] 未找到 node，跳过纯协议验证码尝试", file=sys.stderr)
+        _logger.info("[*] 未找到 node，跳过纯协议验证码尝试")
     except Exception as e:
-        print(f"[*] 纯协议验证码尝试失败: {e}", file=sys.stderr)
+        _logger.info(f"[*] 纯协议验证码尝试失败: {e}")
     return None
 
 
@@ -84,28 +87,28 @@ def _get_fresh_captcha_or_raise(no_browser: bool, captcha_session=None) -> str:
     # browser (launching a second Camoufox conflicts with the existing one).
     if captcha_session:
         for attempt in range(3):
-            print(f"[*] 使用持久浏览器获取 captcha (attempt {attempt + 1}/3)...", file=sys.stderr)
+            _logger.info(f"[*] 使用持久浏览器获取 captcha (attempt {attempt + 1}/3)...")
             try:
                 token, _fp = captcha_session.get_captcha()
                 return token
             except Exception as sess_err:
-                print(f"[!] 持久浏览器获取失败: {sess_err}", file=sys.stderr)
+                _logger.warning(f"[!] 持久浏览器获取失败: {sess_err}")
                 if attempt < 2:
                     time.sleep(2)
         raise ZaibotError("持久浏览器获取 captcha 失败，已重试 3 次")
 
     # No persistent session: launch one-shot Camoufox
-    print("[*] 启动 Camoufox 获取 captcha_verify_param...", file=sys.stderr)
+    _logger.info("[*] 启动 Camoufox 获取 captcha_verify_param...")
     try:
         from captcha_service import get_captcha_verify_param
         captcha = get_captcha_verify_param()
     except Exception as svc_err:
-        print(f"[!] Camoufox 验证码失败: {svc_err}", file=sys.stderr)
+        _logger.warning(f"[!] Camoufox 验证码失败: {svc_err}")
         try:
             from tools.auto_captcha import get_auto_captcha
             captcha = get_auto_captcha()
         except Exception as auto_err:
-            print(f"[!] 自动验证码失败: {auto_err}", file=sys.stderr)
+            _logger.warning(f"[!] 自动验证码失败: {auto_err}")
             from tools.get_captcha import get_captcha
             captcha = get_captcha()
     if not captcha:
@@ -127,7 +130,7 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
         try:
             captcha, _fp = captcha_session.get_captcha()
         except Exception as e:
-            print(f"[!] 获取 captcha 失败: {e}，将在需要时重试", file=sys.stderr)
+            _logger.warning(f"[!] 获取 captcha 失败: {e}，将在需要时重试")
 
     last_error = None
     for attempt in range(max_retries + 1):
@@ -145,9 +148,9 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
             kind = e.kind if isinstance(e, ZaibotAPIError) else classify_error(e.status, e.body)
             last_error = e
             if isinstance(e, ZaibotHTTPError):
-                print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status} {kind}", file=sys.stderr)
+                _logger.warning(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status} {kind}")
             else:
-                print(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}", file=sys.stderr)
+                _logger.warning(f"[!] API 失败 (attempt {attempt + 1}/{max_retries + 1}): {kind}")
 
             # Signature errors are never retriable
             if "X-Signature" in kind or "签名" in kind:
@@ -172,13 +175,13 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
                 try:
                     captcha = _get_fresh_captcha_or_raise(no_browser, captcha_session=captcha_session)
                 except Exception as captcha_err:
-                    print(f"[!] 获取新 captcha 失败: {captcha_err}", file=sys.stderr)
+                    _logger.warning(f"[!] 获取新 captcha 失败: {captcha_err}")
                     if attempt < max_retries:
                         continue
                     raise
 
                 if attempt < max_retries:
-                    print(f"[*] 重试中...", file=sys.stderr)
+                    _logger.info(f"[*] 重试中...")
                     continue
 
             raise ZaibotError(f"请求失败: {kind}") from last_error
@@ -189,7 +192,7 @@ def ask(prompt: str, *, model: str = "GLM-5.1", stream: bool = True, no_browser:
 def interactive(args: argparse.Namespace) -> None:
     from captcha_service import CaptchaSession
 
-    print("Z.ai API interactive. Ctrl-D/Ctrl-C 退出。", file=sys.stderr)
+    _logger.info("Z.ai API interactive. Ctrl-D/Ctrl-C 退出。")
 
     headless = not args.no_headless
     captcha_sess = None
@@ -198,12 +201,12 @@ def interactive(args: argparse.Namespace) -> None:
             captcha_sess = CaptchaSession(headless=headless)
             captcha_sess.start()
         except Exception as e:
-            print(f"[!] 持久浏览器启动失败，回退到按需启动: {e}", file=sys.stderr)
+            _logger.warning(f"[!] 持久浏览器启动失败，回退到按需启动: {e}")
             captcha_sess = None
 
     # Chat session for conversation continuity
     chat_sess = ChatSession(model=args.model)
-    print(f"[*] 会话模式: 所有消息在同一个聊天中", file=sys.stderr)
+    _logger.info(f"[*] 会话模式: 所有消息在同一个聊天中")
 
     try:
         while True:
@@ -226,10 +229,10 @@ def interactive(args: argparse.Namespace) -> None:
                     chat_session=chat_sess,
                 )
             except Exception as e:
-                print(f"[x] {e}", file=sys.stderr)
+                _logger.warning(f"[x] {e}")
     finally:
         if captcha_sess:
-            print("[*] 关闭持久浏览器...", file=sys.stderr)
+            _logger.info("[*] 关闭持久浏览器...")
             captcha_sess.close()
 
 
@@ -244,7 +247,7 @@ def _single_shot(prompt: str, args: argparse.Namespace) -> int:
             captcha_sess = CaptchaSession(headless=headless)
             captcha_sess.start()
         except Exception as e:
-            print(f"[!] 持久浏览器启动失败: {e}", file=sys.stderr)
+            _logger.warning(f"[!] 持久浏览器启动失败: {e}")
             captcha_sess = None
 
     # Create chat session if --chat-id is provided
@@ -266,7 +269,7 @@ def _single_shot(prompt: str, args: argparse.Namespace) -> int:
         )
         return 0
     except Exception as e:
-        print(f"[x] {e}", file=sys.stderr)
+        _logger.warning(f"[x] {e}")
         return 1
     finally:
         if captcha_sess:
@@ -290,9 +293,9 @@ def main() -> int:
         interactive(args)
         return 0
 
-    print(f"[*] {prompt}", file=sys.stderr)
+    _logger.info(f"[*] {prompt}")
     if args.chat_id:
-        print(f"[*] 继续会话: {args.chat_id}", file=sys.stderr)
+        _logger.info(f"[*] 继续会话: {args.chat_id}")
     return _single_shot(prompt, args)
 
 

@@ -64,6 +64,8 @@ class TTLCache(Generic[V]):
             entry = self._data.get(key)
             if entry is None:
                 return False
+            if (time.monotonic() - entry.last_access) > self._ttl:
+                return False
             return True
 
     def __getitem__(self, key: str) -> V:

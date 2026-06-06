@@ -3,6 +3,9 @@
 import json, time
 from pathlib import Path
 from camoufox import Camoufox
+import logging
+_logger = logging.getLogger(__name__)
+
 
 STATE_FILE = Path(__file__).parent / "zaibot_state.json"
 
@@ -16,7 +19,7 @@ with Camoufox(headless=False, geoip=False, humanize=True) as browser:
     page.goto("https://chat.z.ai/", wait_until="domcontentloaded")
     time.sleep(3)
     page.screenshot(path="/tmp/zaibot_1_loaded.png")
-    print("[1] Page loaded, screenshot saved")
+    _logger.info("[1] Page loaded, screenshot saved")
 
     # Load captcha SDK
     page.evaluate("""
@@ -30,7 +33,7 @@ with Camoufox(headless=False, geoip=False, humanize=True) as browser:
     time.sleep(2)
 
     has_init = page.evaluate("typeof window.initAliyunCaptcha")
-    print(f"[2] initAliyunCaptcha = {has_init}")
+    _logger.info(f"[2] initAliyunCaptcha = {has_init}")
 
     if has_init == "function":
         page.screenshot(path="/tmp/zaibot_2_sdk.png")
@@ -64,11 +67,11 @@ with Camoufox(headless=False, geoip=False, humanize=True) as browser:
         """)
         time.sleep(3)
         page.screenshot(path="/tmp/zaibot_3_init.png")
-        print("[3] initAliyunCaptcha called, screenshot saved")
+        _logger.info("[3] initAliyunCaptcha called, screenshot saved")
 
         page.click("#chat-captcha-trigger")
         time.sleep(3)
         page.screenshot(path="/tmp/zaibot_4_clicked.png")
-        print("[4] Trigger clicked, screenshot saved")
+        _logger.info("[4] Trigger clicked, screenshot saved")
 
     input("Press Enter to close...")

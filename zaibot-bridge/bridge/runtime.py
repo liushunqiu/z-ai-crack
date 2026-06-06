@@ -14,6 +14,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import queue
 import sys
@@ -22,9 +23,7 @@ import urllib.request
 import threading
 import time
 import urllib.parse
-import uuid
-from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Iterator
 
 from .models import (
     InternalRequest,
@@ -37,12 +36,12 @@ from .models import (
 from .dsml import ToolCallStreamParser
 from .session_cache import TTLCache
 from .prompt_compat import flatten_to_prompt
+from . import config
 
-# 将 zaibot 目录加入 path 以便导入
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "zaibot"))
+from zaibot import zaibot_core
+from zaibot.captcha_service import CaptchaSession
 
-import zaibot_core
-from captcha_service import CaptchaSession
+_logger = logging.getLogger(__name__)
 
 
 class ChatRuntimeService:
@@ -54,12 +53,12 @@ class ChatRuntimeService:
     - 实际的 chat API 请求通过 urllib + per-account token/cookie
     """
 
-    SESSION_MAX_SIZE = 256
-    SESSION_TTL_SECONDS = 1800.0
+    SESSION_MAX_SIZE = config.SESSION_MAX_SIZE
+    SESSION_TTL_SECONDS = config.SESSION_TTL_SECONDS
     # 每个账号的最小请求间隔（秒）
-    MIN_REQUEST_INTERVAL = 2.0
-    # 切到 pure HTTP 路径: env ZAIBOT_USE_PURE_HTTP=1
-    USE_PURE_HTTP = os.environ.get("ZAIBOT_USE_PURE_HTTP", "").lower() in ("1", "true", "yes")
+    MIN_REQUEST_INTERVAL = config.MIN_REQUEST_INTERVAL
+    # 切到 pure HTTP 路径
+    USE_PURE_HTTP = config.USE_PURE_HTTP
 
     def __init__(self, account_manager) -> None:
         self.account_manager = account_manager
@@ -117,7 +116,7 @@ class ChatRuntimeService:
             return self.account_manager.acquire_ip_slot()
         ip_wait = await loop.run_in_executor(None, _wait_ip_slot)
         if ip_wait > 0:
-            print(f"[*] IP 槽位等待 {ip_wait:.2f}s", file=sys.stderr)
+            _logger.info("IP slot wait %.2fs", ip_wait)
 
         # 单账号最小间隔 (保留原行为)
         account_id = account.id
@@ -126,7 +125,7 @@ class ChatRuntimeService:
             elapsed = time.time() - last_time
             if elapsed < self.MIN_REQUEST_INTERVAL:
                 wait_time = self.MIN_REQUEST_INTERVAL - elapsed
-                print(f"[*] 请求间隔等待 {wait_time:.1f}s (account={account.name})", file=sys.stderr)
+                _logger.info("Request interval wait %.1fs (account=%s)", wait_time, account.name)
                 await asyncio.sleep(wait_time)
             self._last_request_time[account_id] = time.time()
 
@@ -149,7 +148,7 @@ class ChatRuntimeService:
             for attempt in range(max_retries + 1):
                 tool_parser = ToolCallStreamParser()
                 try:
-                    print(f"[*] === 请求 attempt {attempt}/{max_retries} (account={account.name}) ===", file=sys.stderr)
+                    _logger.info("Request attempt %d/%d (account=%s)", attempt, max_retries, account.name)
 
                     token = zaibot_core.read_token_from_state(state_path)
                     user_id = zaibot_core.get_user_id(token)
@@ -166,19 +165,19 @@ class ChatRuntimeService:
 
                     if session.chat_id:
                         chat_id = session.chat_id
-                        print(f"[*] 复用已有 chat_id: {chat_id}", file=sys.stderr)
+                        _logger.info("Reuse chat_id: %s", chat_id)
                     else:
                         cookie_for_create = zaibot_core.load_cookie_header_from_state(state_path)
                         chat_id = zaibot_core.create_chat_with_token(token, cookie_for_create, req.model)
                         session.chat_id = chat_id
-                        print(f"[*] 创建新 chat_id: {chat_id}", file=sys.stderr)
+                        _logger.info("Created new chat_id: %s", chat_id)
 
                     parent_id = session.last_assistant_id
                     captcha_verify_param, fingerprint = self._get_fresh_captcha_for_account(account_id)
 
                     if not captcha_verify_param:
                         msg = "captcha 生成失败 (send button 持续 disabled 或无 cert), 跳过本 attempt"
-                        print(f"[!] {msg}", file=sys.stderr)
+                        _logger.warning("%s", msg)
                         event_queue.put(StreamError(msg))
                         event_queue.put(None)
                         return
@@ -231,10 +230,10 @@ class ChatRuntimeService:
 
                     # 选路径: pure HTTP (urllib) vs DOM fetch (Camoufox)
                     if self.USE_PURE_HTTP:
-                        print(f"[*] 路径: PURE HTTP (urllib, 跳过 Camoufox fetch)", file=sys.stderr)
+                        _logger.info("Path: PURE HTTP (urllib, skip Camoufox fetch)")
                         item_iter = self._pure_http_streaming(path, headers, body_str)
                     else:
-                        print(f"[*] 路径: DOM FETCH (Camoufox 持久 page)", file=sys.stderr)
+                        _logger.info("Path: DOM FETCH (Camoufox persistent page)")
                         item_iter = captcha_sess.fetch_streaming(path, headers, body_str)
 
                     for item in item_iter:
@@ -242,7 +241,7 @@ class ChatRuntimeService:
                             resp_status = int(item["status"])
                             if resp_status >= 400:
                                 saw_error_status = True
-                                print(f"[!] HTTP 错误: status={resp_status}", file=sys.stderr)
+                                _logger.warning("HTTP error: status=%d", resp_status)
                             continue
                         if "chunk" not in item:
                             continue
@@ -265,20 +264,20 @@ class ChatRuntimeService:
                                 kind = zaibot_core.classify_error(200, err_str)
                                 last_error = err_str
                                 last_error_kind = kind
-                                print(f"[!] SSE 错误 (attempt {attempt}): kind={kind}, err={err_str[:200]}", file=sys.stderr)
+                                _logger.warning("SSE error (attempt %d): kind=%s, err=%s", attempt, kind, err_str[:200])
                                 # IP 级别上报 (限流/verify_failed 会触发集群检测, 必须传 body)
                                 self.account_manager.report_request_failure(kind, err_str, account_id)
                                 if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
                                     if is_first and session.chat_id is not None and session.last_assistant_id is None:
                                         session.chat_id = None
-                                        print(f"[*] 首次消息失败且无 assistant 回复，重置 chat_id 避免服务端状态污染", file=sys.stderr)
+                                        _logger.info("First message failed with no assistant reply, reset chat_id")
                                     # verify_failed / FRONTEND_CAPTCHA_REQUIRED 视为 IP 限流信号:
                                     # 重试等于送死, 直接退避
                                     if "verify_failed" in err_str or "FRONTEND_CAPTCHA_REQUIRED" in err_str:
                                         backoff = 5 * (2 ** attempt)
-                                        print(f"[!] verify_failed → 退避 {backoff}s 后再重试 (避免雪上加霜)", file=sys.stderr)
+                                        _logger.warning("verify_failed -> backoff %ds before retry", backoff)
                                         time.sleep(backoff)
-                                    print(f"[*] 可重试错误，{'保留' if session.chat_id else '重置后'}chat_id 并重试...", file=sys.stderr)
+                                    _logger.info("Retriable error, retry with chat_id %s", "kept" if session.chat_id else "reset")
                                     retriable_sse_error = True
                                     break
                                 event_queue.put(StreamError(err_str))
@@ -309,7 +308,7 @@ class ChatRuntimeService:
                         continue
 
                     if not sse_event_count and attempt < max_retries:
-                        print(f"[*] SSE 流结束但无事件 (attempt {attempt})，重试...", file=sys.stderr)
+                        _logger.info("SSE stream ended with no events (attempt %d), retrying...", attempt)
                         continue
 
                     for ev in tool_parser.flush():
@@ -325,13 +324,13 @@ class ChatRuntimeService:
                     kind = zaibot_core.classify_error(e.status, e.body)
                     last_error = f"HTTP {e.status}: {e.body[:500]}"
                     last_error_kind = kind
-                    print(f"[!] ZaibotHTTP 错误 (attempt {attempt}): {last_error[:200]}", file=sys.stderr)
+                    _logger.warning("ZaibotHTTP error (attempt %d): %s", attempt, last_error[:200])
                     # IP 级别上报 (传 body 才能识别 verify_failed)
                     self.account_manager.report_request_failure(kind, e.body or "", account_id)
                     if zaibot_core.is_retriable_error(kind) and attempt < max_retries:
                         if kind == "限流" or "verify_failed" in (e.body or "") or "FRONTEND_CAPTCHA_REQUIRED" in (e.body or ""):
                             # Aliyun WAF blocked us - 风控限流 (IP 级别)
-                            print(f"[!] 风控限流信号！账号 {account.name} + IP 全局 进入冷却期 (30分钟)", file=sys.stderr)
+                            _logger.warning("Rate limit signal! Account %s + IP global cooldown 30min", account.name)
                             # 标记账号进入冷却期
                             self.account_manager.mark_rate_limited(account_id)
                             # 触发 IP 级别冷却, 暂停所有账号
@@ -343,7 +342,7 @@ class ChatRuntimeService:
                         else:
                             # 退避重试 (避免雪崩)
                             backoff = 2 * (2 ** attempt)
-                            print(f"[*] 可重试 HTTP 错误，退避 {backoff}s 后重试...", file=sys.stderr)
+                            _logger.info("Retriable HTTP error, backoff %ds then retry...", backoff)
                             time.sleep(backoff)
                         continue
                     event_queue.put(StreamError(last_error, e.status))
@@ -352,16 +351,16 @@ class ChatRuntimeService:
                 except zaibot_core.ZaibotAPIError as e:
                     last_error = f"{e.kind}: {e.body[:500]}"
                     last_error_kind = e.kind
-                    print(f"[!] API 错误 (attempt {attempt}): {last_error[:200]}", file=sys.stderr)
+                    _logger.warning("API error (attempt %d): %s", attempt, last_error[:200])
                     # IP 级别上报 (传 body 才能识别 verify_failed)
                     self.account_manager.report_request_failure(e.kind, e.body or "", account_id)
                     if zaibot_core.is_retriable_error(e.kind) and attempt < max_retries:
                         if "verify_failed" in (e.body or "") or "FRONTEND_CAPTCHA_REQUIRED" in (e.body or ""):
                             backoff = 5 * (2 ** attempt)
-                            print(f"[*] 可重试 API 错误 (verify_failed)，退避 {backoff}s 后重试...", file=sys.stderr)
+                            _logger.info("Retriable API error (verify_failed), backoff %ds then retry...", backoff)
                             time.sleep(backoff)
                         else:
-                            print(f"[*] 可重试 API 错误，重试...", file=sys.stderr)
+                            _logger.info("Retriable API error, retrying...")
                         continue
                     event_queue.put(StreamError(last_error))
                     event_queue.put(None)
@@ -369,14 +368,14 @@ class ChatRuntimeService:
                 except zaibot_core.ZaibotError as e:
                     last_error = str(e)
                     last_error_kind = "未知错误"
-                    print(f"[!] Zaibot 错误 (attempt {attempt}): {e}", file=sys.stderr)
+                    _logger.warning("Zaibot error (attempt %d): %s", attempt, e)
                     event_queue.put(StreamError(str(e)))
                     event_queue.put(None)
                     return
                 except Exception as e:
                     last_error = f"未知错误: {str(e)}"
                     last_error_kind = "未知错误"
-                    print(f"[!] 未知错误 (attempt {attempt}): {type(e).__name__}: {e}", file=sys.stderr)
+                    _logger.exception("Unknown error (attempt %d): %s", attempt, e)
                     event_queue.put(StreamError(f"未知错误: {str(e)}"))
                     event_queue.put(None)
                     return
@@ -441,11 +440,11 @@ class ChatRuntimeService:
         """清除所有过期会话，返回清除数量。"""
         return self._sessions.sweep_expired()
 
-    def session_stats(self):
+    def session_stats(self) -> CacheStats:
         """返回会话缓存统计。"""
         return self._sessions.stats()
 
-    def _pure_http_streaming(self, path: str, headers: dict, body: str):
+    def _pure_http_streaming(self, path: str, headers: dict, body: str) -> Iterator[dict]:
         """Pure-HTTP 路径: 用 urllib 流式请求 chat-completion, 绕过 Camoufox fetch。
 
         和 captcha_sess.fetch_streaming 产出同样的 {status, chunk} 字典格式,

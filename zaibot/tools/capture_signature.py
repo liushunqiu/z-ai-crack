@@ -10,6 +10,10 @@ import sys
 import time
 from pathlib import Path
 from camoufox import Camoufox, DefaultAddons
+import logging
+
+_logger = logging.getLogger(__name__)
+
 
 STATE_FILE = Path(__file__).parent / "zaibot_state.json"
 OUTPUT_FILE = Path(__file__).parent / "captured_request.json"
@@ -17,21 +21,21 @@ SIGNATURE_CACHE_FILE = Path(__file__).parent / "zaibot_signature_cache.json"
 
 def capture():
     if not STATE_FILE.exists():
-        print("[x] No saved session. Run: python3 login.py login")
+        _logger.warning("[x] No saved session. Run: python3 login.py login")
         sys.exit(1)
 
     with open(STATE_FILE) as f:
         state = json.load(f)
 
-    print("=" * 60)
-    print("  Camoufox Signature Capture")
-    print("=" * 60)
-    print("  [1] Browser will open to chat.z.ai")
-    print("  [2] Type a message and click Send")
-    print("  [3] If captcha appears, solve it manually")
-    print("  [4] Request will be auto-captured")
-    print("  [5] Close browser when done (or press Ctrl+C)")
-    print("=" * 60)
+    _logger.info("=" * 60)
+    _logger.info("  Camoufox Signature Capture")
+    _logger.info("=" * 60)
+    _logger.info("  [1] Browser will open to chat.z.ai")
+    _logger.info("  [2] Type a message and click Send")
+    _logger.info("  [3] If captcha appears, solve it manually")
+    _logger.info("  [4] Request will be auto-captured")
+    _logger.info("  [5] Close browser when done (or press Ctrl+C)")
+    _logger.info("=" * 60)
 
     captured = {"requests": []}
 
@@ -81,7 +85,7 @@ def capture():
         """)
 
         page.on("console", lambda msg: (
-            print(f"  [console] {msg.text[:200]}")
+            _logger.info(f"  [console] {msg.text[:200]}")
             if "[CAPTURE]" in msg.text else None
         ))
 
@@ -93,14 +97,14 @@ def capture():
             new_chat = page.query_selector("button:has-text('New Chat'), a:has-text('New Chat')")
             if new_chat:
                 new_chat.click()
-                print("[*] Clicked New Chat")
+                _logger.info("[*] Clicked New Chat")
                 time.sleep(2)
         except Exception:
             pass
 
-        print("[*] Ready. Type a message in the browser and click Send.")
-        print("[*] Waiting for API request capture...")
-        print()
+        _logger.info("[*] Ready. Type a message in the browser and click Send.")
+        _logger.info("[*] Waiting for API request capture...")
+        _logger.info()
 
         # Poll for captured requests
         try:
@@ -111,24 +115,24 @@ def capture():
                     new_reqs = requests[len(captured["requests"]):]
                     for req in new_reqs:
                         captured["requests"].append(req)
-                        print(f"\n[✓] CAPTURED REQUEST!")
-                        print(f"    URL: {req['url'][:120]}")
-                        print(f"    Method: {req['method']}")
-                        print(f"    Headers:")
+                        _logger.info(f"\n[✓] CAPTURED REQUEST!")
+                        _logger.info(f"    URL: {req['url'][:120]}")
+                        _logger.info(f"    Method: {req['method']}")
+                        _logger.info(f"    Headers:")
                         for k, v in req.get("headers", {}).items():
                             val = str(v)
                             if len(val) > 80:
                                 val = val[:80] + "..."
-                            print(f"      {k}: {val}")
+                            _logger.info(f"      {k}: {val}")
                         body = req.get("body", "")
                         if body:
                             try:
                                 body_json = json.loads(body)
-                                print(f"    Body model: {body_json.get('model')}")
-                                print(f"    Body messages: {len(body_json.get('messages', []))} msgs")
-                                print(f"    Body stream: {body_json.get('stream')}")
+                                _logger.info(f"    Body model: {body_json.get('model')}")
+                                _logger.info(f"    Body messages: {len(body_json.get('messages', []))} msgs")
+                                _logger.info(f"    Body stream: {body_json.get('stream')}")
                             except:
-                                print(f"    Body length: {len(body)}")
+                                _logger.info(f"    Body length: {len(body)}")
 
                         # Save immediately
                         with open(OUTPUT_FILE, "w") as f:
@@ -137,6 +141,7 @@ def capture():
                         # Also save the latest signature in the API client's cache format.
                         try:
                             from urllib.parse import urlparse, parse_qs
+
                             headers_l = {str(k).lower(): v for k, v in req.get("headers", {}).items()}
                             sig = headers_l.get("x-signature")
                             qs = parse_qs(urlparse(req.get("url", "")).query)
@@ -149,18 +154,18 @@ def capture():
                                         "created_at": time.time(),
                                         "source": "capture_signature.py",
                                     }, sf, indent=2)
-                                print(f"[✓] Signature cache saved to {SIGNATURE_CACHE_FILE}")
+                                _logger.info(f"[✓] Signature cache saved to {SIGNATURE_CACHE_FILE}")
                         except Exception as e:
-                            print(f"[!] Signature cache save skipped: {e}")
+                            _logger.warning(f"[!] Signature cache save skipped: {e}")
 
-                        print(f"[✓] Saved to {OUTPUT_FILE}")
+                        _logger.info(f"[✓] Saved to {OUTPUT_FILE}")
 
         except KeyboardInterrupt:
-            print("\n[*] Interrupted by user")
+            _logger.info("\n[*] Interrupted by user")
 
-    print(f"\n[✓] Total captured: {len(captured['requests'])} requests")
+    _logger.info(f"\n[✓] Total captured: {len(captured['requests'])} requests")
     if captured["requests"]:
-        print(f"[✓] Data saved to {OUTPUT_FILE}")
+        _logger.info(f"[✓] Data saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     capture()

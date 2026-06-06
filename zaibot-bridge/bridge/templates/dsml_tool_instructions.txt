@@ -1,0 +1,21 @@
+## TOOL CALL FORMAT
+
+To call a tool, emit a single block in this exact shape:
+
+<|DSML|tool_calls>
+  <|DSML|invoke name="TOOL_NAME">
+    <|DSML|parameter name="PARAM"><![CDATA[VALUE]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+
+You may write a brief one-sentence intent BEFORE the block when it helps (e.g. "Running tests now."). Do NOT put prose AFTER the block, and do NOT wrap the block in markdown fences.
+
+## RULES
+
+1. **One block per turn** — if you need multiple tool calls, put several <|DSML|invoke> inside the same <|DSML|tool_calls>.
+2. **Strings → CDATA** — wrap every string value in <![CDATA[...]]>, including code, paths, and file content.
+3. **Objects / arrays → nested XML** — never raw JSON. Objects become nested <|DSML|parameter>; arrays use <item> children.
+4. **Numbers / booleans / null → plain text** — no quotes, no CDATA.
+5. **Use the exact parameter names from the tool schema** — do not invent or rename fields.
+6. **Write files via the Write tool, never via Bash heredoc / echo / printf** — the Write tool's `content` parameter is raw file content, not shell syntax.
+7. **Edit files via apply_patch (unified diff) or Edit** — do not use sed / awk in Bash.

@@ -28,6 +28,7 @@ import json
 import re
 import uuid
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from .models import (
     InternalStreamEvent,
     TextDelta,
@@ -35,6 +36,22 @@ from .models import (
     ToolCallEnd,
     ToolCallStart,
 )
+
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+
+def _load_tool_instructions() -> str:
+    path = _TEMPLATES_DIR / "dsml_tool_instructions.txt"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return ""
+
+
+def _load_tool_usage_notes() -> dict[str, str]:
+    path = _TEMPLATES_DIR / "dsml_tool_usage_notes.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
 
 # ──────────────────────────────────────────────────────────────
 # DSML 渲染:tool_calls(JSON 数组) -> DSML 文本
@@ -172,28 +189,7 @@ def _escape_xml_text(text: str) -> str:
 #   照搬 PromptCompatService.injectToolDefinitions + buildToolCallInstructions
 # ──────────────────────────────────────────────────────────────
 
-_TOOL_CALL_INSTRUCTIONS = """## TOOL CALL FORMAT
-
-To call a tool, emit a single block in this exact shape:
-
-<|DSML|tool_calls>
-  <|DSML|invoke name="TOOL_NAME">
-    <|DSML|parameter name="PARAM"><![CDATA[VALUE]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-
-You may write a brief one-sentence intent BEFORE the block when it helps (e.g. "Running tests now."). Do NOT put prose AFTER the block, and do NOT wrap the block in markdown fences.
-
-## RULES
-
-1. **One block per turn** — if you need multiple tool calls, put several <|DSML|invoke> inside the same <|DSML|tool_calls>.
-2. **Strings → CDATA** — wrap every string value in <![CDATA[...]]>, including code, paths, and file content.
-3. **Objects / arrays → nested XML** — never raw JSON. Objects become nested <|DSML|parameter>; arrays use <item> children.
-4. **Numbers / booleans / null → plain text** — no quotes, no CDATA.
-5. **Use the exact parameter names from the tool schema** — do not invent or rename fields.
-6. **Write files via the Write tool, never via Bash heredoc / echo / printf** — the Write tool's `content` parameter is raw file content, not shell syntax.
-7. **Edit files via apply_patch (unified diff) or Edit** — do not use sed / awk in Bash.
-"""
+_TOOL_CALL_INSTRUCTIONS = _load_tool_instructions()
 
 
 def _example_params(name: str) -> str | None:
@@ -296,21 +292,7 @@ def _extract_tool_schema(tool: dict) -> dict | None:
     return None
 
 
-_TOOL_USAGE_NOTES: dict[str, str] = {
-    # codex 的 update_plan 注册完计划后,plan 已经在 UI 左侧显示给用户。
-    # DeepSeek 默认会"礼貌地"用自然语言复述一遍并问用户要不要开始,把 agent
-    # 流程拖死在第 0 步。这里明确告诉它:注册=立即执行。
-    "update_plan": (
-        "IMPORTANT: After calling update_plan, the plan is already shown to the user in the UI. "
-        "You MUST immediately proceed to execute step 1 via another tool call in the SAME response. "
-        "Do NOT restate, summarize, or describe the plan in natural language. "
-        "Do NOT ask the user to confirm before proceeding."
-    ),
-    "apply_patch": (
-        "Use apply_patch to edit existing files. Provide unified diff format in the 'patch' parameter. "
-        "Do NOT use sed, awk, or Bash commands to edit files."
-    ),
-}
+_TOOL_USAGE_NOTES: dict[str, str] = _load_tool_usage_notes()
 
 
 def format_tools_section(tools: list[dict]) -> str:

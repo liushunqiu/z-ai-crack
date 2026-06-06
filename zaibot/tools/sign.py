@@ -6,11 +6,22 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-sys.path.insert(0, str(Path(__file__).parent))
-import zaibot_core as z
+from zaibot import zaibot_core as z
+
+import os
+import logging
+_logger = logging.getLogger(__name__)
 
 
-def verify_captured(path: Path) -> int:
+
+def _get_secret(args_secret: str | None = None) -> str:
+    secret = (args_secret or os.environ.get("ZAIBOT_HMAC_SECRET", "")).strip()
+    if not secret:
+        raise SystemExit("错误: 必须提供 --secret 或设置 ZAIBOT_HMAC_SECRET 环境变量")
+    return secret
+
+
+def verify_captured(path: Path, secret: str) -> int:
     data = json.loads(path.read_text())
     ok = 0
     total = 0
@@ -25,7 +36,7 @@ def verify_captured(path: Path) -> int:
             continue
         total += 1
         actual = z.sign_with_secret(
-            z.DEFAULT_HMAC_SECRET,
+            secret,
             body.get("signature_prompt") or body.get("messages", [{}])[-1].get("content", ""),
             qs["timestamp"][0],
             qs["requestId"][0],
@@ -33,14 +44,15 @@ def verify_captured(path: Path) -> int:
         )
         passed = actual == expected
         ok += int(passed)
-        print(f"[{total}] {'OK' if passed else 'FAIL'} expected={expected} actual={actual}")
-    print(f"pass {ok}/{total}")
+        _logger.info(f"[{total}] {'OK' if passed else 'FAIL'} expected={expected} actual={actual}")
+    _logger.info(f"pass {ok}/{total}")
     return 0 if ok == total and total else 1
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify-captured", type=Path, default=Path(__file__).parent / "captured_request.json")
+    ap.add_argument("--secret", help="HMAC secret (fallback: ZAIBOT_HMAC_SECRET env)")
     ap.add_argument("--prompt")
     ap.add_argument("--timestamp")
     ap.add_argument("--request-id")
@@ -49,9 +61,11 @@ def main() -> int:
     if args.prompt:
         if not (args.timestamp and args.request_id and args.user_id):
             ap.error("--prompt requires --timestamp --request-id --user-id")
-        print(z.sign_with_secret(z.DEFAULT_HMAC_SECRET, args.prompt, args.timestamp, args.request_id, args.user_id))
+        secret = _get_secret(args.secret)
+        _logger.info(z.sign_with_secret(secret, args.prompt, args.timestamp, args.request_id, args.user_id))
         return 0
-    return verify_captured(args.verify_captured)
+    secret = _get_secret(args.secret)
+    return verify_captured(args.verify_captured, secret)
 
 if __name__ == "__main__":
     raise SystemExit(main())

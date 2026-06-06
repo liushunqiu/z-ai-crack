@@ -13,6 +13,10 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
+import logging
+
+_logger = logging.getLogger(__name__)
+
 
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
@@ -63,6 +67,7 @@ def get_auto_captcha(port: int | None = None, save: bool = True, timeout: int = 
     wait_cdp(port)
 
     from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -146,4 +151,4 @@ def get_auto_captcha(port: int | None = None, save: bool = True, timeout: int = 
 
 if __name__ == "__main__":
     raw = get_auto_captcha()
-    print(raw)
+    _logger.info(raw)

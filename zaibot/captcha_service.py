@@ -7,6 +7,7 @@ Uses Camoufox anti-detection browser to run the full TRACELESS captcha flow:
 Returns captcha_verify_param (base64-encoded JSON with certifyId, sceneId, isSign, securityToken).
 """
 from __future__ import annotations
+import logging
 
 import base64
 import json
@@ -23,6 +24,8 @@ CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
 STATE_FILE = BASE_DIR / "zaibot_state.json"
 SCENE_ID = "didk33e0"
 
+
+_logger = logging.getLogger(__name__)
 
 def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 15) -> tuple:
     """Trigger captcha flow on an already-loaded page and return (certify_id, security_token).
@@ -61,7 +64,7 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
         time.sleep(random.uniform(0.06, 0.18))
 
     think = random.uniform(2.5, 5.0)
-    print(f"[*] thinking {think:.2f}s before send", file=sys.stderr)
+    _logger.info(f"[*] thinking {think:.2f}s before send")
     time.sleep(think)
 
     certify_id = None
@@ -90,7 +93,7 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
                             if btn_pos is None:
                                 raise RuntimeError("send button not found")
                             if btn_pos.get("disabled"):
-                                print(f"[*] send button disabled, 等待 1.5s 后重试 ({click_try + 1}/3)", file=sys.stderr)
+                                _logger.info(f"[*] send button disabled, 等待 1.5s 后重试 ({click_try + 1}/3)")
                                 time.sleep(1.5)
                                 continue
                             tx, ty = btn_pos["x"], btn_pos["y"]
@@ -114,7 +117,7 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
                         except RuntimeError as e:
                             if "not found" in str(e):
                                 raise  # 真的找不到, 不要再试
-                            print(f"[*] send button click 失败: {e}, 重试", file=sys.stderr)
+                            _logger.info(f"[*] send button click 失败: {e}, 重试")
                             time.sleep(1.0)
                     if not clicked:
                         raise RuntimeError("send button 持续 disabled, 跳过 captcha")
@@ -126,19 +129,19 @@ def _trigger_captcha_flow(page, *, click_send: bool = True, max_retries: int = 1
             if result.get("securityToken"):
                 certify_id = result.get("certifyId")
                 security_token = result["securityToken"]
-                print(f"[✓] Got securityToken! certifyId={certify_id}", file=sys.stderr)
+                _logger.info(f"[✓] Got securityToken! certifyId={certify_id}")
                 break
 
             if body.get("CaptchaType") and body.get("CertifyId"):
                 certify_id = body["CertifyId"]
-                print(f"[*] Got InitCaptchaV3: certifyId={certify_id}, type={body['CaptchaType']}", file=sys.stderr)
+                _logger.info(f"[*] Got InitCaptchaV3: certifyId={certify_id}, type={body['CaptchaType']}")
 
         except Exception as e:
             err_str = str(e)
             if "Timeout" in err_str or "timeout" in err_str:
-                print(f"[*] Attempt {attempt + 1}/{max_retries}: timeout", file=sys.stderr)
+                _logger.info(f"[*] Attempt {attempt + 1}/{max_retries}: timeout")
                 continue
-            print(f"[!] Attempt {attempt + 1}: unexpected error: {e}", file=sys.stderr)
+            _logger.warning(f"[!] Attempt {attempt + 1}: unexpected error: {e}")
             raise
 
     if not security_token:
@@ -242,17 +245,17 @@ def get_captcha_verify_param(headless: bool = True, save: bool = True, timeout: 
 
     state = json.loads(STATE_FILE.read_text())
 
-    print(f"[*] Launching Camoufox (headless={headless})...", file=sys.stderr)
+    _logger.info(f"[*] Launching Camoufox (headless={headless})...")
     with Camoufox(headless=headless, geoip=False) as browser:
         context = browser.new_context(storage_state=state)
         page = context.new_page()
 
-        print(f"[*] Navigating to chat.z.ai...", file=sys.stderr)
+        _logger.info(f"[*] Navigating to chat.z.ai...")
         page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_selector("#chat-input", timeout=15000)
-        print(f"[*] Page ready: {page.title()}", file=sys.stderr)
+        _logger.info(f"[*] Page ready: {page.title()}")
 
-        print(f"[*] Sending message and waiting for captcha responses...", file=sys.stderr)
+        _logger.info(f"[*] Sending message and waiting for captcha responses...")
         certify_id, security_token = _trigger_captcha_flow(page)
 
         raw, param_obj = _build_captcha_raw(certify_id, security_token)
@@ -368,7 +371,7 @@ class CaptchaSession:
             )
 
         state = json.loads(self.state_path.read_text())
-        print(f"[*] Launching persistent Camoufox (headless={self.headless}, state={self.state_path}, account={self.account_name})...", file=sys.stderr)
+        _logger.info(f"[*] Launching persistent Camoufox (headless={self.headless}, state={self.state_path}, account={self.account_name})...")
 
         # 为每个账号生成独立的浏览器配置
         # 这样可以避免账号被关联
@@ -396,12 +399,12 @@ class CaptchaSession:
             # 阻止 WebRTC：根据账号决定
             config["block_webrtc"] = (hash_val % 2 == 0)
 
-            print(f"[*] Browser config for {self.account_name}: os={config['os']}, locale={config['locale']}, block_webrtc={config['block_webrtc']}", file=sys.stderr)
+            _logger.info(f"[*] Browser config for {self.account_name}: os={config['os']}, locale={config['locale']}, block_webrtc={config['block_webrtc']}")
 
         self._browser_ctx = Camoufox(**config)
         self._browser = self._browser_ctx.__enter__()
         self._context = self._browser.new_context(storage_state=state)
-        print(f"[*] Persistent browser ready (account={self.account_name}).", file=sys.stderr)
+        _logger.info(f"[*] Persistent browser ready (account={self.account_name}).")
 
     def interactive_login(self, *, on_progress=None) -> bool:
         """Headful login flow: open chat.z.ai and wait for user to complete login.
@@ -471,7 +474,7 @@ class CaptchaSession:
         if not self._context:
             raise RuntimeError("Session not started. Call start() first.")
 
-        print(f"[*] Getting fresh captcha token (new tab)...", file=sys.stderr)
+        _logger.info(f"[*] Getting fresh captcha token (new tab)...")
 
         # Per-session rate limit: Aliyun's WAF blocks bursts (~20 captchas in
         # <30s) with HTTP 405. Sleep until the minimum interval has elapsed
@@ -479,7 +482,7 @@ class CaptchaSession:
         now = time.time()
         wait = self._last_captcha_at + self._min_captcha_interval - now
         if wait > 0:
-            print(f"[*] captcha rate limit: sleeping {wait:.2f}s (min interval {self._min_captcha_interval}s)", file=sys.stderr)
+            _logger.info(f"[*] captcha rate limit: sleeping {wait:.2f}s (min interval {self._min_captcha_interval}s)")
             time.sleep(wait)
 
         page = self._context.new_page()
@@ -491,7 +494,7 @@ class CaptchaSession:
         # 为 undefined 而整个 Node.js 进程崩溃。
         def _swallow_page_error(err):
             try:
-                print(f"[!] page error (swallowed): {err}", file=sys.stderr)
+                _logger.warning(f"[!] page error (swallowed): {err}")
             except Exception:
                 pass
         page.on("pageerror", _swallow_page_error)
@@ -506,9 +509,9 @@ class CaptchaSession:
             if self._fingerprint is None:
                 try:
                     self._fingerprint = _collect_fingerprint(page)
-                    print(f"[*] Captured browser fingerprint (ua={self._fingerprint.get('user_agent', '')[:60]}...)", file=sys.stderr)
+                    _logger.info(f"[*] Captured browser fingerprint (ua={self._fingerprint.get('user_agent', '')[:60]}...)")
                 except Exception as e:
-                    print(f"[!] fingerprint collection failed: {e}", file=sys.stderr)
+                    _logger.warning(f"[!] fingerprint collection failed: {e}")
                     self._fingerprint = None
         except Exception:
             try:
@@ -572,7 +575,7 @@ class CaptchaSession:
         )
         page.goto("https://chat.z.ai/", wait_until="domcontentloaded", timeout=30000)
         self._fetch_page = page
-        print(f"[*] Persistent fetch page ready (native fetch captured).", file=sys.stderr)
+        _logger.info(f"[*] Persistent fetch page ready (native fetch captured).")
         return page
 
     def fetch(self, url: str, headers: dict, body: str) -> dict:
@@ -761,14 +764,14 @@ class CaptchaSession:
 
 if __name__ == "__main__":
     headless = "--no-headless" not in sys.argv
-    print(f"[*] Starting captcha service (headless={headless})...", file=sys.stderr)
+    _logger.info(f"[*] Starting captcha service (headless={headless})...")
     try:
         result = get_captcha_verify_param(headless=headless)
         decoded = json.loads(base64.b64decode(result))
-        print(f"[✓] captcha_verify_param obtained", file=sys.stderr)
-        print(f"    certifyId: {decoded['certifyId']}", file=sys.stderr)
-        print(f"    securityToken: {decoded['securityToken'][:40]}...", file=sys.stderr)
+        _logger.info(f"[✓] captcha_verify_param obtained")
+        _logger.info(f"    certifyId: {decoded['certifyId']}")
+        _logger.info(f"    securityToken: {decoded['securityToken'][:40]}...")
         print(result)
     except Exception as e:
-        print(f"[x] Failed: {e}", file=sys.stderr)
+        _logger.warning(f"[x] Failed: {e}")
         sys.exit(1)

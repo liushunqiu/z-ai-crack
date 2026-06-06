@@ -13,6 +13,7 @@ API 端点:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -23,11 +24,20 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 
 # 将 bridge 目录加入 path
 sys.path.insert(0, os.path.dirname(__file__))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_logger = logging.getLogger(__name__)
 
 from bridge.models import InternalRequest, InternalStreamEvent
 from bridge.model_alias import resolve_model, list_models_for_api
@@ -44,6 +54,33 @@ account_manager: AccountManager | None = None
 BRIDGE_DIR = Path(__file__).parent
 STATIC_DIR = BRIDGE_DIR / "static"
 DATA_DIR = BRIDGE_DIR / "data"
+
+# Admin API 认证
+_admin_key = os.environ.get("ZAIBOT_ADMIN_KEY", "")
+_api_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+
+
+async def verify_admin_key(request: Request, api_key: str | None = Security(_api_key_header)):
+    """验证 Admin API 访问权限。
+
+    优先级:
+    1. 请求头携带 X-Admin-Key 且与 ZAIBOT_ADMIN_KEY 匹配 → 通过
+    2. ZAIBOT_ADMIN_KEY 未设置 → 仅允许本机访问 (127.0.0.1 / ::1)
+    3. 其他情况 → 403
+    """
+    global _admin_key
+    if _admin_key:
+        if api_key == _admin_key:
+            return
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    # 未配置密钥时仅允许本机
+    host = request.client.host if request.client else ""
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Admin API disabled for remote access. Set ZAIBOT_ADMIN_KEY to enable remote admin.",
+    )
 
 
 @asynccontextmanager
@@ -68,7 +105,7 @@ async def lifespan(app: FastAPI):
             if runtime:
                 evicted = runtime.sweep_expired_sessions()
                 if evicted:
-                    print(f"[session-cache] swept {evicted} expired sessions", file=sys.stderr)
+                    _logger.info("Session cache swept %d expired sessions", evicted)
 
     sweep_task = asyncio.create_task(_session_sweep_loop())
     yield
@@ -89,6 +126,15 @@ app = FastAPI(
     description="OpenAI 兼容 API 代理，底层使用 Z.ai",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+_cors_origins = os.environ.get("ZAIBOT_CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors_origins],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -270,14 +316,14 @@ async def admin_index():
     return FileResponse(index, media_type="text/html")
 
 
-@app.get("/admin/api/accounts")
+@app.get("/admin/api/accounts", dependencies=[Depends(verify_admin_key)])
 async def admin_list_accounts():
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
     return {"accounts": account_manager.list_accounts()}
 
 
-@app.post("/admin/api/accounts")
+@app.post("/admin/api/accounts", dependencies=[Depends(verify_admin_key)])
 async def admin_create_account(request: Request):
     """创建新账号 (status=pending_login, 等待 start_interactive_login)。"""
     if not account_manager:
@@ -293,7 +339,7 @@ async def admin_create_account(request: Request):
         raise HTTPException(400, str(e))
 
 
-@app.post("/admin/api/accounts/{account_id}/login")
+@app.post("/admin/api/accounts/{account_id}/login", dependencies=[Depends(verify_admin_key)])
 async def admin_start_login(account_id: int, request: Request):
     """启动 headful 浏览器, 用户手动登录, 完成后保存 state 并标记 active。
 
@@ -309,7 +355,7 @@ async def admin_start_login(account_id: int, request: Request):
 
     if not use_sse:
         # 简单阻塞模式
-        result = await _run_login_blocking(account_id, lambda msg: print(f"[admin-login] {msg}", file=sys.stderr))
+        result = await _run_login_blocking(account_id, lambda msg: _logger.info("[admin-login] %s", msg))
         return {"ok": result}
 
     # SSE 进度模式
@@ -349,11 +395,11 @@ async def _run_login_blocking(account_id: int, on_progress) -> bool:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        lambda: account_manager.start_interactive_login(account_id, on_progress=lambda m: print(f"[admin-login] {m}", file=sys.stderr)),
+        lambda: account_manager.start_interactive_login(account_id, on_progress=lambda m: _logger.info("[admin-login] %s", m)),
     )
 
 
-@app.delete("/admin/api/accounts/{account_id}")
+@app.delete("/admin/api/accounts/{account_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_delete_account(account_id: int):
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
@@ -363,7 +409,7 @@ async def admin_delete_account(account_id: int):
     return {"ok": True}
 
 
-@app.post("/admin/api/accounts/{account_id}/test")
+@app.post("/admin/api/accounts/{account_id}/test", dependencies=[Depends(verify_admin_key)])
 async def admin_test_account(account_id: int):
     """端到端测试: state + captcha + API。通过则自动 mark active。
 
@@ -381,7 +427,7 @@ async def admin_test_account(account_id: int):
     return result
 
 
-@app.patch("/admin/api/accounts/{account_id}")
+@app.patch("/admin/api/accounts/{account_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_update_account(account_id: int, request: Request):
     """更新账号状态 (active/disabled/error) 或备注。"""
     if not account_manager:
@@ -395,7 +441,7 @@ async def admin_update_account(account_id: int, request: Request):
         raise HTTPException(400, str(e))
 
 
-@app.post("/admin/api/accounts/{account_id}/reset")
+@app.post("/admin/api/accounts/{account_id}/reset", dependencies=[Depends(verify_admin_key)])
 async def admin_reset_account(account_id: int):
     """重置账号：清除状态文件，设置为 pending_login 状态。
 
@@ -415,7 +461,7 @@ async def admin_reset_account(account_id: int):
         raise HTTPException(500, f"重置失败: {e}")
 
 
-@app.get("/admin/api/accounts/{account_id}/cooldown")
+@app.get("/admin/api/accounts/{account_id}/cooldown", dependencies=[Depends(verify_admin_key)])
 async def admin_get_account_cooldown(account_id: int):
     """获取账号的冷却期状态。"""
     if not account_manager:
@@ -427,14 +473,14 @@ async def admin_get_account_cooldown(account_id: int):
         raise HTTPException(500, f"获取冷却期状态失败: {e}")
 
 
-@app.get("/admin/api/bindings")
+@app.get("/admin/api/bindings", dependencies=[Depends(verify_admin_key)])
 async def admin_list_bindings():
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
     return {"bindings": account_manager.list_bindings()}
 
 
-@app.get("/admin/api/bindings/{session_id}")
+@app.get("/admin/api/bindings/{session_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_get_binding(session_id: str):
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
@@ -444,7 +490,7 @@ async def admin_get_binding(session_id: str):
     return info
 
 
-@app.patch("/admin/api/bindings/{session_id}")
+@app.patch("/admin/api/bindings/{session_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_rebind_session(session_id: str, request: Request):
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
@@ -458,7 +504,7 @@ async def admin_rebind_session(session_id: str, request: Request):
         raise HTTPException(400, str(e))
 
 
-@app.delete("/admin/api/bindings/{session_id}")
+@app.delete("/admin/api/bindings/{session_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_unbind_session(session_id: str):
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
@@ -466,14 +512,14 @@ async def admin_unbind_session(session_id: str):
     return {"ok": ok}
 
 
-@app.get("/admin/api/events")
+@app.get("/admin/api/events", dependencies=[Depends(verify_admin_key)])
 async def admin_list_events(limit: int = 50):
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
     return {"events": account_manager.db.list_events(limit=limit)}
 
 
-@app.get("/admin/api/resolve")
+@app.get("/admin/api/resolve", dependencies=[Depends(verify_admin_key)])
 async def admin_resolve_session(session_id: str):
     """预览: 给定 session_id 会绑定到哪个账号 (不实际绑定)。"""
     if not account_manager:
@@ -486,9 +532,10 @@ async def admin_resolve_session(session_id: str):
 
 
 if __name__ == "__main__":
+    _host = os.environ.get("ZAIBOT_HOST", "127.0.0.1")
     uvicorn.run(
         "server:app",
-        host="0.0.0.0",
+        host=_host,
         port=8001,  # 使用 8001 端口避免与 deepseek-bridge 冲突
         reload=False,
     )

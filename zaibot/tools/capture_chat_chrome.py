@@ -2,6 +2,10 @@
 """Capture real chat/completions request/response in Google Chrome via CDP."""
 import json, os, subprocess, time, urllib.request
 from pathlib import Path
+import logging
+
+_logger = logging.getLogger(__name__)
+
 BASE_DIR=Path(__file__).parent
 STATE_FILE=BASE_DIR/'zaibot_state.json'
 OUT=BASE_DIR/'captured_chrome_chat.json'
@@ -22,6 +26,7 @@ def main():
     prompt='hello capture chrome'
     launch(port); wait(port)
     from playwright.sync_api import sync_playwright
+
     captured={'requests':[],'responses':[],'console':[]}
     with sync_playwright() as p:
         browser=p.chromium.connect_over_cdp(f'http://127.0.0.1:{port}',timeout=15000)
@@ -50,14 +55,14 @@ def main():
         def on_req(req):
             if '/chat/completions' in req.url or 'captcha' in req.url or 'device.saf' in req.url:
                 captured['requests'].append({'url':req.url,'method':req.method,'headers':dict(req.headers),'body':req.post_data,'ts':time.time()})
-                print('[REQ]',req.method,req.url[:180])
+                _logger.info('[REQ]',req.method,req.url[:180])
         def on_resp(resp):
             if '/chat/completions' in resp.url or 'captcha' in resp.url or 'device.saf' in resp.url:
                 body=None
                 try: body=resp.text()[:4000]
                 except Exception: body='<unavailable>'
                 captured['responses'].append({'url':resp.url,'status':resp.status,'headers':dict(resp.headers),'body':body,'ts':time.time()})
-                print('[RESP]',resp.status,resp.url[:180], (body or '')[:200].replace('\n',' '))
+                _logger.info('[RESP]',resp.status,resp.url[:180], (body or '')[:200].replace('\n',' '))
         page.on('request', on_req); page.on('response', on_resp)
         page.goto('https://chat.z.ai/',wait_until='domcontentloaded',timeout=60000)
         if STATE_FILE.exists():
@@ -78,7 +83,7 @@ def main():
         }""", prompt)
         time.sleep(0.5)
         btn=page.query_selector('#send-message-button')
-        print('[*] btn disabled?', btn.is_disabled() if btn else None)
+        _logger.info('[*] btn disabled?', btn.is_disabled() if btn else None)
         if btn: btn.click()
         for i in range(120):
             time.sleep(1)
@@ -88,6 +93,6 @@ def main():
                 break
         time.sleep(8)
         OUT.write_text(json.dumps(captured,indent=2,ensure_ascii=False),encoding='utf-8')
-        print('[+] saved',OUT)
+        _logger.info('[+] saved',OUT)
         browser.close()
 if __name__=='__main__': main()

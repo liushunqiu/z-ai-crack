@@ -9,21 +9,20 @@
 """
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
-# 加入 path 以便 import zaibot 的 captcha_service / zaibot_core
-_BRIDGE_DIR = Path(__file__).parent.parent
-ZAIBOT_DIR = _BRIDGE_DIR.parent / "zaibot"
-sys.path.insert(0, str(ZAIBOT_DIR))
+from zaibot.captcha_service import CaptchaSession
 
-from captcha_service import CaptchaSession  # noqa: E402
+from .db import Account, AccountDB  # noqa: E402
+from . import config  # noqa: E402
+from .rate_limiter import RateLimiter  # noqa: E402
 
-from .db import Account, AccountDB, account_to_public_dict  # noqa: E402
+_logger = logging.getLogger(__name__)
 
 
 class AccountManager:
@@ -39,23 +38,12 @@ class AccountManager:
         # round-robin 游标
         self._rr_lock = threading.Lock()
         self._rr_cursor = 0
-        # ====== IP 级别风控 (4G/NAT 共享出口场景) ======
-        # 全局请求最小间隔: 任意账号两次请求的最小时间差
-        self.GLOBAL_MIN_INTERVAL = 1.0
-        # 全局冷却: 任意账号触发限流时设置, 所有账号暂停
-        self._global_cooldown_until: float = 0
-        self._global_cooldown_lock = threading.Lock()
-        # 集群失败: 滑动窗口内的 (timestamp, account_id) 元组
-        # 修复多账号误杀: 只有 N 个**不同账号**都失败才触发 IP 冷却
-        self._cluster_failures: list[tuple[float, int]] = []
-        self._cluster_lock = threading.Lock()
-        self._last_global_request_time: float = 0
-        # ====== 全局 captcha 并发限制 (4G IP 共享场景) ======
-        # 同一 IP 上同时只能有 N 个账号在解 captcha, 否则 WAF 判定为刷 captcha
-        self.MAX_CONCURRENT_CAPTCHAS = 2
-        self._captcha_in_flight = 0
-        self._captcha_slot_lock = threading.Lock()
-        self._captcha_slot_cv = threading.Condition(self._captcha_slot_lock)
+        # 统一限流模块
+        self.rate_limiter = RateLimiter(
+            db,
+            global_min_interval=config.GLOBAL_MIN_INTERVAL,
+            max_concurrent_captchas=config.MAX_CONCURRENT_CAPTCHAS,
+        )
         # 启动时尝试为 active 账号恢复浏览器
         self._startup_init()
 
@@ -81,7 +69,7 @@ class AccountManager:
                     # 尝试自动激活
                     result = self._try_activate_from_state(acc.id)
                     if result:
-                        print(f"[account-manager] auto-activated account {acc.name}: {result}", file=sys.stderr)
+                        _logger.info(f"[account-manager] auto-activated account {acc.name}: {result}")
             elif acc.status == "cooldown":
                 # 检查冷却期是否结束
                 now = time.time()
@@ -98,10 +86,10 @@ class AccountManager:
                         account_id=acc.id,
                         detail="冷却期结束，自动恢复",
                     )
-                    print(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active", file=sys.stderr)
+                    _logger.info(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active")
                 else:
                     remaining = (cooldown_until - now) / 60
-                    print(f"[account-manager] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟", file=sys.stderr)
+                    _logger.info(f"[account-manager] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟")
 
     # ---------- 账号管理 (admin API) ----------
 
@@ -180,15 +168,15 @@ class AccountManager:
         if state_path.exists():
             try:
                 state_path.unlink()
-                print(f"[account-manager] 已删除状态文件: {state_path}", file=sys.stderr)
+                _logger.info(f"[account-manager] 已删除状态文件: {state_path}")
             except Exception as e:
-                print(f"[account-manager] 删除状态文件失败: {e}", file=sys.stderr)
+                _logger.info(f"[account-manager] 删除状态文件失败: {e}")
 
         # 3. 清除该账号的所有 session 绑定
         with self._session_lock:
             for b in self.db.list_bindings_for_account(account_id):
                 self.db.delete_binding(b.session_id)
-                print(f"[account-manager] 已清除 session 绑定: {b.session_id}", file=sys.stderr)
+                _logger.info(f"[account-manager] 已清除 session 绑定: {b.session_id}")
 
         # 4. 将账号状态设置为 pending_login
         self.db.update_account(
@@ -207,7 +195,7 @@ class AccountManager:
             detail=f"手动重置账号 {acc.name}",
         )
 
-        print(f"[account-manager] 账号 {acc.name} 已重置为 pending_login 状态", file=sys.stderr)
+        _logger.info(f"[account-manager] 账号 {acc.name} 已重置为 pending_login 状态")
 
         return {
             "ok": True,
@@ -302,12 +290,12 @@ class AccountManager:
                     max_retries = 3
                     for attempt in range(max_retries):
                         try:
-                            print(f"[*] 尝试导航到 chat.z.ai/auth (attempt {attempt + 1}/{max_retries})", file=sys.stderr)
+                            _logger.info(f"[*] 尝试导航到 chat.z.ai/auth (attempt {attempt + 1}/{max_retries})")
                             page.goto("https://chat.z.ai/auth", wait_until="domcontentloaded", timeout=90000)
-                            print(f"[*] 导航成功", file=sys.stderr)
+                            _logger.info(f"[*] 导航成功")
                             break
                         except Exception as e:
-                            print(f"[!] 导航失败 (attempt {attempt + 1}): {e}", file=sys.stderr)
+                            _logger.warning(f"[!] 导航失败 (attempt {attempt + 1}): {e}")
                             if attempt < max_retries - 1:
                                 time.sleep(5)
                                 continue
@@ -368,7 +356,16 @@ class AccountManager:
                                 pass
                             user_name = auth_info.get("name", "") or auth_info.get("email", "")
 
-                            # 保存 state (先于 DB 更新, 失败可重试)
+                            # 先标记 active (DB 是事实来源), 再保存 state 文件
+                            self.db.update_account(
+                                account_id,
+                                status="active",
+                                user_id=user_id,
+                                user_name=user_name,
+                                last_login_at=time.time(),
+                            )
+
+                            # 保存 state (DB 已更新, 即使这里失败下次也可重试)
                             try:
                                 storage = context.storage_state()
                                 state_path.write_text(
@@ -378,17 +375,7 @@ class AccountManager:
                             except Exception as e:
                                 if on_progress:
                                     on_progress(f"save_error: {e}")
-                                time.sleep(2)
-                                continue
-
-                            # 标记 active
-                            self.db.update_account(
-                                account_id,
-                                status="active",
-                                user_id=user_id,
-                                user_name=user_name,
-                                last_login_at=time.time(),
-                            )
+                                # 不 return False, 让外层处理或下次重试
                             if on_progress:
                                 on_progress("login_succeeded")
                             self.db.record_event(
@@ -473,8 +460,7 @@ class AccountManager:
             on_progress("calling_api")
         try:
             # 用 zaibot_core 的 helper
-            sys.path.insert(0, str(ZAIBOT_DIR))
-            import zaibot_core as _zc
+            from zaibot import zaibot_core as _zc
             cookie = _zc.load_cookie_header_from_state(state_path)
             chat_id = _zc.create_chat_with_token(result["token"], cookie, "GLM-5.1")
         except Exception as e:
@@ -590,103 +576,28 @@ class AccountManager:
 
     # ---------- 请求执行时的查找 ----------
 
-    def check_ip_cooldown(self) -> Optional[float]:
-        """检查是否在全局 IP 冷却期。返回剩余秒数, None 表示不在冷却。"""
-        with self._global_cooldown_lock:
-            now = time.time()
-            if now < self._global_cooldown_until:
-                return self._global_cooldown_until - now
-            return None
+    # ---------- 限流委托 (统一由 RateLimiter 处理) ----------
 
-    def trigger_ip_cooldown(self, minutes: int, reason: str = ""):
-        """触发全局 IP 冷却, 所有账号暂停。"""
-        with self._global_cooldown_lock:
-            self._global_cooldown_until = time.time() + minutes * 60
-            print(f"[!] IP 级别风控: 全局冷却 {minutes} 分钟 ({reason})", file=sys.stderr)
-        self.db.record_event(
-            "ip_cooldown",
-            detail=f"{minutes}min: {reason}",
-        )
+    def check_ip_cooldown(self) -> float | None:
+        return self.rate_limiter.check_ip_cooldown()
+
+    def trigger_ip_cooldown(self, minutes: int, reason: str = "") -> None:
+        self.rate_limiter.trigger_ip_cooldown(minutes, reason)
 
     def acquire_ip_slot(self) -> float:
-        """获取全局请求槽位: 阻塞直到距上次请求 ≥ GLOBAL_MIN_INTERVAL。
-
-        返回实际等待的秒数。
-        """
-        while True:
-            with self._global_cooldown_lock:
-                wait = self._last_global_request_time + self.GLOBAL_MIN_INTERVAL - time.time()
-                if wait <= 0:
-                    self._last_global_request_time = time.time()
-                    return 0.0
-            time.sleep(min(wait, 0.5))
+        return self.rate_limiter.acquire_ip_slot()
 
     def acquire_captcha_slot(self) -> None:
-        """获取全局 captcha 槽位: 阻塞直到 in-flight captcha < MAX_CONCURRENT_CAPTCHAS。
-
-        4G/NAT 共享出口场景下, 多个账号同时触发 InitCaptchaV3 会被 WAF
-        判定为"刷 captcha"。限制并发数到 2 是经验值。
-        """
-        with self._captcha_slot_cv:
-            while self._captcha_in_flight >= self.MAX_CONCURRENT_CAPTCHAS:
-                self._captcha_slot_cv.wait(timeout=0.5)
-            self._captcha_in_flight += 1
+        self.rate_limiter.acquire_captcha_slot()
 
     def release_captcha_slot(self) -> None:
-        """释放 captcha 槽位。"""
-        with self._captcha_slot_cv:
-            self._captcha_in_flight = max(0, self._captcha_in_flight - 1)
-            self._captcha_slot_cv.notify_all()
+        self.rate_limiter.release_captcha_slot()
 
     def report_request_failure(self, kind: str, body: str = "", account_id: int = 0) -> None:
-        """汇报一次请求失败, 用于 IP 级别的集群失败检测。
-
-        限流类错误 (限流/verify_failed) 会:
-          1. 推入滑动窗口 (timestamp, account_id)
-          2. 统计**不同账号**数, ≥ 动态阈值才触发全局冷却 30 分钟
-             阈值 = max(3, active_count // 2), 避免多账号场景误杀
-             (单账号反复失败 = 账号问题, 不等于 IP 问题)
-
-        注意: verify_failed 在 classify_error 里被归到 "captcha_verify_param 失效或缺失",
-        kind 字符串里看不到, 必须从 body 二次判断。
-        """
-        # 限流类错误才计 cluster — kind + body 两个维度
-        is_rate_signal = (
-            "限流" in kind
-            or "verify_failed" in (body or "")
-            or "FRONTEND_CAPTCHA_REQUIRED" in (body or "")
-            or "F018" in (body or "")  # Aliyun WAF verify_failed 错误码
-        )
-        if not is_rate_signal:
-            return
-
-        with self._cluster_lock:
-            now = time.time()
-            self._cluster_failures.append((now, account_id))
-            # 60s 滑动窗口
-            cutoff = now - 60
-            self._cluster_failures = [
-                (t, aid) for (t, aid) in self._cluster_failures if t >= cutoff
-            ]
-
-            # 按"不同账号数"判定, 而不是"总失败次数"
-            unique_accounts = {aid for (_, aid) in self._cluster_failures if aid}
-            active_count = len(self.db.list_active_accounts())
-            threshold = max(3, active_count // 2)
-
-            if len(unique_accounts) >= threshold:
-                # 多账号同窗口内都被风控 → IP 级别问题
-                self.trigger_ip_cooldown(
-                    minutes=30,
-                    reason=f"60s 内 {len(unique_accounts)}/{active_count} 个账号触发限流",
-                )
-                # 重置窗口, 避免冷却期内反复触发
-                self._cluster_failures.clear()
+        self.rate_limiter.report_failure(kind, body, account_id)
 
     def report_request_success(self) -> None:
-        """汇报一次请求成功, 清空 cluster 失败窗口。"""
-        with self._cluster_lock:
-            self._cluster_failures.clear()
+        self.rate_limiter.report_success()
 
     def resolve_account(self, session_id: Optional[str]) -> Optional[Account]:
         """根据 session_id 解析出要用的账号。
@@ -712,7 +623,7 @@ class AccountManager:
                 if acc and acc.status == "cooldown":
                     cooldown_info = self.get_account_cooldown_info(acc.id)
                     remaining = cooldown_info.get("remaining_minutes", 0)
-                    print(f"[!] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟", file=sys.stderr)
+                    _logger.warning(f"[!] 账号 {acc.name} 在冷却期，剩余 {remaining:.1f} 分钟")
                     return None
                 # 绑定失效, 重新选
                 self.db.delete_binding(session_id)
@@ -841,7 +752,7 @@ class AccountManager:
         if error_count >= 3:
             acc = self.db.get_account(account_id)
             if acc and acc.status == "active":
-                print(f"[!] 账号 {acc.name} 在 1 小时内出现 {error_count} 次错误，自动禁用", file=sys.stderr)
+                _logger.warning(f"[!] 账号 {acc.name} 在 1 小时内出现 {error_count} 次错误，自动禁用")
                 self.db.update_account(
                     account_id,
                     status="disabled",
@@ -868,7 +779,7 @@ class AccountManager:
 
         cooldown_until = time.time() + (cooldown_minutes * 60)
 
-        print(f"[!] 账号 {acc.name} 被风控，进入冷却期 {cooldown_minutes} 分钟", file=sys.stderr)
+        _logger.warning(f"[!] 账号 {acc.name} 被风控，进入冷却期 {cooldown_minutes} 分钟")
 
         # 更新账号状态为冷却中
         self.db.update_account(
@@ -913,7 +824,7 @@ class AccountManager:
                         account_id=acc.id,
                         detail="冷却期结束，自动恢复",
                     )
-                    print(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active", file=sys.stderr)
+                    _logger.info(f"[account-manager] 账号 {acc.name} 冷却期结束，已恢复为 active")
                     recovered.append(account_to_public_dict(self.db.get_account(acc.id)))
 
         return recovered

@@ -15,5 +15,9 @@ if [ ! -f "../zaibot/zaibot_token.txt" ] && [ ! -f "../zaibot/zaibot_state.json"
 fi
 
 # 启动服务
+# 环境变量说明:
+#   ZAIBOT_HOST        - 绑定地址 (默认 127.0.0.1, 如需远程访问请改为 0.0.0.0)
+#   ZAIBOT_ADMIN_KEY   - Admin API 密钥 (未设置时仅允许本机访问 /admin/*)
+#   ZAIBOT_CORS_ORIGINS - CORS 允许来源 (默认 *, 多来源用逗号分隔)
 echo "Starting Z.ai Bridge on port 8001..."
 python3 server.py

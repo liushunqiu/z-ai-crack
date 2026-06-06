@@ -12,6 +12,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import logging
+
+_logger = logging.getLogger(__name__)
+
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_FILE = BASE_DIR / "captcha_analysis_chrome.json"
@@ -48,28 +52,29 @@ def launch_chrome(port: int):
 def main():
     port = int(os.environ.get("ZAIBOT_CDP_PORT", "9223"))
     proc = launch_chrome(port)
-    print(f"[*] launched Chrome pid={proc.pid} port={port}", flush=True)
+    _logger.info(f"[*] launched Chrome pid={proc.pid} port={port}", flush=True)
     # Wait until CDP endpoint is reachable.
     import urllib.request
     for i in range(30):
         time.sleep(1)
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1).read()
-            print("[*] CDP ready", flush=True)
+            _logger.info("[*] CDP ready", flush=True)
             break
         except Exception as e:
             if i % 5 == 0:
-                print(f"[*] waiting CDP {i}s: {e}", flush=True)
+                _logger.info(f"[*] waiting CDP {i}s: {e}", flush=True)
     else:
         raise RuntimeError(f"CDP port {port} not reachable")
 
     from playwright.sync_api import sync_playwright
+
     captured = {"requests": [], "responses": [], "console": [], "verify_params": []}
 
     with sync_playwright() as p:
-        print("[*] connecting playwright CDP", flush=True)
+        _logger.info("[*] connecting playwright CDP", flush=True)
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
-        print("[*] connected", flush=True)
+        _logger.info("[*] connected", flush=True)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
 
         context.add_init_script(r"""
@@ -122,9 +127,9 @@ def main():
             if any(k in url.lower() for k in ["captcha", "aliyun", "aliyuncs", "device", "saf", "cloudauth", "certify", "verify", "chat/completions"]):
                 rec = {"url": url, "method": req.method, "headers": dict(req.headers), "body": req.post_data, "ts": time.time()}
                 captured["requests"].append(rec)
-                print(f"[REQ] {req.method} {url[:160]}")
+                _logger.info(f"[REQ] {req.method} {url[:160]}")
                 if req.post_data:
-                    print(f"      body {req.post_data[:300]}")
+                    _logger.info(f"      body {req.post_data[:300]}")
 
         def on_response(resp):
             url = resp.url
@@ -136,7 +141,7 @@ def main():
                 except Exception:
                     body = "<binary/unavailable>"
                 captured["responses"].append({"url": url, "status": resp.status, "headers": dict(resp.headers), "body": body, "ts": time.time()})
-                print(f"[RESP] {resp.status} {url[:160]}")
+                _logger.info(f"[RESP] {resp.status} {url[:160]}")
 
         page.on("request", on_request)
         page.on("response", on_response)
@@ -180,7 +185,7 @@ def main():
         """)
         time.sleep(15)
         page.evaluate("document.getElementById('chat-captcha-trigger').click()")
-        print("[*] 如果弹出滑块，请在 Chrome 里手动完成。等待最多 180 秒...")
+        _logger.info("[*] 如果弹出滑块，请在 Chrome 里手动完成。等待最多 180 秒...")
 
         for i in range(90):
             time.sleep(2)
@@ -192,16 +197,16 @@ def main():
                 except Exception:
                     decoded = None
                 captured["verify_params"].append({"raw": raw, "decoded": decoded, "ts": time.time()})
-                print("[+] captcha solved", decoded)
+                _logger.info("[+] captcha solved", decoded)
                 break
             if i % 10 == 0:
                 errors = page.evaluate("window.__captchaErrors || []")
                 trace = page.evaluate("window.__zaibotCaptchaTrace || {}")
-                print(f"  [{i*2}s] waiting errors={errors} trace_counts={{k: len(v) if isinstance(v, list) else v for k,v in trace.items()}}")
+                _logger.info(f"  [{i*2}s] waiting errors={errors} trace_counts={{k: len(v) if isinstance(v, list) else v for k,v in trace.items()}}")
 
         captured["page_trace"] = page.evaluate("window.__zaibotCaptchaTrace || {}")
         OUTPUT_FILE.write_text(json.dumps(captured, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[+] saved {OUTPUT_FILE}")
+        _logger.info(f"[+] saved {OUTPUT_FILE}")
         browser.close()
     # keep Chrome process; user may want it. Do not terminate.
     return 0

@@ -18,6 +18,10 @@ import base64
 import subprocess
 import os
 from pathlib import Path
+import logging
+
+_logger = logging.getLogger(__name__)
+
 
 BASE_DIR = Path(__file__).parent
 CACHE_FILE = BASE_DIR / "zaibot_captcha_cache.json"
@@ -40,14 +44,14 @@ def find_chrome():
 def get_captcha():
     chrome_path = find_chrome()
     if not chrome_path:
-        print("[x] Chrome not found. Install Google Chrome.", file=sys.stderr)
+        _logger.warning("[x] Chrome not found. Install Google Chrome.")
         sys.exit(1)
 
     # Launch Chrome with remote debugging
     debug_port = 9222
     user_data_dir = Path.home() / ".config" / "zaibot-chrome-profile"
 
-    print(f"[*] Launching Chrome on port {debug_port}...", file=sys.stderr)
+    _logger.info(f"[*] Launching Chrome on port {debug_port}...")
     proc = subprocess.Popen([
         chrome_path,
         f"--remote-debugging-port={debug_port}",
@@ -61,25 +65,26 @@ def get_captcha():
 
     try:
         from playwright.sync_api import sync_playwright
+
     except ImportError:
-        print("[x] playwright not installed", file=sys.stderr)
+        _logger.warning("[x] playwright not installed")
         proc.terminate()
         sys.exit(1)
 
     with sync_playwright() as p:
         # Connect to the running Chrome
-        print(f"[*] Connecting to Chrome on port {debug_port}...", file=sys.stderr)
+        _logger.info(f"[*] Connecting to Chrome on port {debug_port}...")
         try:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{debug_port}")
         except Exception as e:
-            print(f"[x] Failed to connect: {e}", file=sys.stderr)
-            print("[*] Make sure Chrome is running with --remote-debugging-port=9222", file=sys.stderr)
+            _logger.warning(f"[x] Failed to connect: {e}")
+            _logger.info("[*] Make sure Chrome is running with --remote-debugging-port=9222")
             proc.terminate()
             sys.exit(1)
 
         contexts = browser.contexts
         if not contexts:
-            print("[x] No browser context found", file=sys.stderr)
+            _logger.warning("[x] No browser context found")
             browser.close()
             proc.terminate()
             sys.exit(1)
@@ -101,7 +106,7 @@ def get_captcha():
         page.wait_for_selector("#chat-input", timeout=30000)
         time.sleep(3)
 
-        print("[*] Page loaded. Setting up captcha capture...", file=sys.stderr)
+        _logger.info("[*] Page loaded. Setting up captcha capture...")
 
         # Inject captcha capture
         page.evaluate("""() => {
@@ -149,7 +154,7 @@ def get_captcha():
         errors = page.evaluate("window.__captchaErrors || []")
 
         if not has_instance:
-            print(f"[!] Captcha instance not created. Errors: {json.dumps(errors)}", file=sys.stderr)
+            _logger.warning(f"[!] Captcha instance not created. Errors: {json.dumps(errors)}")
             # Try triggering via message send first
             page.evaluate("""() => {
                 const t = document.querySelector('#chat-input');
@@ -189,8 +194,8 @@ def get_captcha():
 
         # Trigger captcha
         page.evaluate('document.getElementById("chat-captcha-trigger").click()')
-        print("[*] Captcha triggered! Please solve the slide puzzle in Chrome.", file=sys.stderr)
-        print("[*] Waiting up to 120 seconds...", file=sys.stderr)
+        _logger.info("[*] Captcha triggered! Please solve the slide puzzle in Chrome.")
+        _logger.info("[*] Waiting up to 120 seconds...")
 
         for i in range(120):
             time.sleep(2)
@@ -199,22 +204,22 @@ def get_captcha():
                 raw = results[0]
                 decoded = json.loads(base64.b64decode(raw))
                 has_token = "securityToken" in decoded
-                print(f"\n[+] Captcha solved! hasSecurityToken={has_token}", file=sys.stderr)
-                print(f"    Keys: {list(decoded.keys())}", file=sys.stderr)
+                _logger.info(f"\n[+] Captcha solved! hasSecurityToken={has_token}")
+                _logger.info(f"    Keys: {list(decoded.keys())}")
 
                 cache = {"raw": raw, "decoded": decoded, "timestamp": time.time()}
                 with open(CACHE_FILE, "w") as f:
                     json.dump(cache, f, indent=2)
-                print(f"[+] Saved to {CACHE_FILE}", file=sys.stderr)
+                _logger.info(f"[+] Saved to {CACHE_FILE}")
 
                 # Don't close Chrome - user might want to keep using it
                 browser.close()
                 return raw
 
             if i % 15 == 0:
-                print(f"  [{i*2}s] waiting...", file=sys.stderr)
+                _logger.info(f"  [{i*2}s] waiting...")
 
-        print("[x] Captcha timeout", file=sys.stderr)
+        _logger.warning("[x] Captcha timeout")
         browser.close()
         return ""
 
@@ -222,4 +227,4 @@ def get_captcha():
 if __name__ == "__main__":
     result = get_captcha()
     if result:
-        print(result)
+        _logger.info(result)
