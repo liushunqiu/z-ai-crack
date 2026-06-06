@@ -305,6 +305,9 @@ class CaptchaSession:
         # 新增：账号标识，用于生成独立指纹
         account_id: str | None = None,
         account_name: str | None = None,
+        # 账号专属代理 (socks5://host:port 或 http://host:port)。
+        # 优先于环境变量 ZAIBOT_PROXY; 空串表示直连。
+        proxy: str | None = None,
     ):
         self.headless = headless
         self.state_path: Path = state_path or STATE_FILE
@@ -312,6 +315,7 @@ class CaptchaSession:
         self.captcha_cache_path: Path = captcha_cache_path or CACHE_FILE
         self.account_id = account_id
         self.account_name = account_name
+        self.proxy = proxy
         self._browser_ctx = None
         self._browser = None
         self._context = None
@@ -381,12 +385,13 @@ class CaptchaSession:
         }
 
         # 代理支持：绕过 IP 级 WAF 封禁
+        # 优先级: self.proxy (账号专属) > ZAIBOT_PROXY > HTTPS_PROXY 环境变量
         import os
-        proxy_url = os.environ.get("ZAIBOT_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        proxy_url = self.proxy or os.environ.get("ZAIBOT_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy_url:
             config["proxy"] = {"server": proxy_url}
             config["geoip"] = True
-            _logger.info(f"[*] Using proxy: {proxy_url} (geoip=True)")
+            _logger.info(f"[*] Using proxy: {proxy_url} (account={self.account_name or self.account_id}, geoip=True)")
 
         # 根据账号标识生成不同的指纹配置
         if self.account_id:

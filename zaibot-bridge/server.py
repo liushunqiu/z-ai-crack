@@ -33,20 +33,12 @@ from fastapi.security import APIKeyHeader
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# SOCKS5 代理：配置 urllib 全局走代理（绕过 IP 级 WAF）
-_zaibot_proxy = os.environ.get("ZAIBOT_PROXY", "")
-if _zaibot_proxy.startswith("socks5"):
-    try:
-        import socks as _socks
-        import socket as _socket
-        # 解析 socks5://host:port
-        _proxy_addr = _zaibot_proxy.replace("socks5://", "").replace("socks5h://", "")
-        _proxy_host, _proxy_port = _proxy_addr.rsplit(":", 1)
-        _socks.set_default_proxy(_socks.SOCKS5, _proxy_host, int(_proxy_port))
-        _socket.socket = _socks.socksocket
-        print(f"[proxy] urllib 全局 SOCKS5: {_proxy_host}:{_proxy_port}")
-    except ImportError:
-        print("[proxy] pysocks 未安装，urllib 无法使用 SOCKS5 代理")
+# 代理提示: 全局 SOCKS5 monkey-patch 已移除, 代理现在由 Account.proxy 字段按账号绑定,
+# 在 runtime._pure_http_streaming() 里通过 socks_urllib.make_opener() 单次生效。
+# ZAIBOT_PROXY 环境变量仍可作为账号 proxy 为空时的回退值。
+_zaibot_proxy_fallback = os.environ.get("ZAIBOT_PROXY", "")
+if _zaibot_proxy_fallback:
+    print(f"[proxy] ZAIBOT_PROXY={_zaibot_proxy_fallback} (仅作为账号 proxy 为空时的回退)")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -445,14 +437,22 @@ async def admin_test_account(account_id: int):
 
 @app.patch("/admin/api/accounts/{account_id}", dependencies=[Depends(verify_admin_key)])
 async def admin_update_account(account_id: int, request: Request):
-    """更新账号状态 (active/disabled/error) 或备注。"""
+    """更新账号: status / note / proxy。"""
     if not account_manager:
         raise HTTPException(503, "AccountManager not initialized")
     body = await request.json()
     try:
+        if "proxy" in body:
+            result = account_manager.set_proxy(account_id, body["proxy"] or "")
+            if not result.get("ok"):
+                raise HTTPException(400, result.get("message", "set_proxy failed"))
+            return {"ok": True, "old": result["old"], "new": result["new"]}
         if "status" in body:
             return {"account": account_manager.set_status(account_id, body["status"])}
-        raise HTTPException(400, "暂只支持 status 字段")
+        if "note" in body:
+            account_manager.db.update_account(account_id, note=body["note"])
+            return {"ok": True, "note": body["note"]}
+        raise HTTPException(400, "支持字段: status / note / proxy")
     except ValueError as e:
         raise HTTPException(400, str(e))
 

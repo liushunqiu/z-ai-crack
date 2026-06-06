@@ -115,11 +115,11 @@
         <th>ID</th><th>名称</th><th>状态</th><th>用户</th>
         <th>请求数<br><span class="muted" style="font-weight:400;font-size:11px">近 1h / 24h</span></th>
         <th>错误<br><span class="muted" style="font-weight:400;font-size:11px">细分类型</span></th>
-        <th>最后使用</th><th>备注</th><th>操作</th>
+        <th>最后使用</th><th>代理</th><th>备注</th><th>操作</th>
       </tr>
     </thead>
     <tbody id="account-tbody">
-      <tr><td colspan="9" class="empty">加载中...</td></tr>
+      <tr><td colspan="10" class="empty">加载中...</td></tr>
     </tbody>
   </table>
   </div>
@@ -185,7 +185,7 @@ async function loadAccounts(data) {
   if (!data) data = await api("/admin/api/accounts");
   const tbody = $("account-tbody");
   if (!data.accounts.length) {
-    tbody.innerHTML = `<tr><td colspan="9" class="empty">还没有账号,请先添加</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="empty">还没有账号,请先添加</td></tr>`;
     return;
   }
   tbody.innerHTML = data.accounts.map(a => {
@@ -247,6 +247,12 @@ async function loadAccounts(data) {
         <div class="err-kinds" title="点击查看完整细分">${kindShort}</div>
       </td>
       <td><span class="muted" title="${fmtTs(a.last_used_at)}">${relTime(a.last_used_at)}</span></td>
+      <td>
+        <span class="muted" style="font-size:12px">${a.proxy
+          ? a.proxy.replace(/^socks5h?:\/\//, 'socks5:').replace(/^https?:\/\//, 'http:')
+          : '<em>(默认)</em>'}</span>
+        <button style="margin-left:4px;font-size:11px;padding:1px 6px" onclick="setProxy(${a.id}, '${(a.proxy || "").replace(/'/g, "\\'")}')">改</button>
+      </td>
       <td><span class="muted">${a.note || ""}</span></td>
       <td><div class="btns">${buttons.join(" ")}</div></td>
     </tr>`;
@@ -370,6 +376,22 @@ async function startLogin(accountId) {
 async function setStatus(accountId, status) {
   try {
     await api(`/admin/api/accounts/${accountId}`, {method: "PATCH", body: JSON.stringify({status})});
+    refreshAll();
+  } catch (e) { alert(e.message); }
+}
+
+async function setProxy(accountId, current) {
+  const next = prompt(`账号 #${accountId} 的代理地址\n\n格式: socks5://host:port 或 http://host:port\n留空表示清除 (回退到 ZAIBOT_PROXY 或直连)`, current || "");
+  if (next === null) return;
+  try {
+    const result = await api(`/admin/api/accounts/${accountId}`, {
+      method: "PATCH",
+      body: JSON.stringify({proxy: next}),
+    });
+    const msg = result.ok
+      ? `代理已更新: ${result.old || "(空)"} → ${result.new || "(空)"}`
+      : `更新失败: ${result.message || "未知错误"}`;
+    alert(msg);
     refreshAll();
   } catch (e) { alert(e.message); }
 }

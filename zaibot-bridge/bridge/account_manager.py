@@ -440,7 +440,13 @@ class AccountManager:
         if on_progress:
             on_progress("fetching_captcha")
         try:
-            captcha_sess = CaptchaSession(headless=True, state_path=state_path)
+            captcha_sess = CaptchaSession(
+                headless=True,
+                state_path=state_path,
+                account_id=str(account_id),
+                account_name=acc.name,
+                proxy=acc.proxy or None,
+            )
             captcha_sess.start()
         except Exception as e:
             return {"ok": False, "message": f"启动 captcha 浏览器失败: {e}"}
@@ -670,6 +676,7 @@ class AccountManager:
                 state_path=state_path,
                 account_id=str(account_id),
                 account_name=acc.name,
+                proxy=acc.proxy or None,
             )
             sess.start()
             self._sessions[account_id] = sess
@@ -689,6 +696,32 @@ class AccountManager:
             ids = list(self._sessions.keys())
         for aid in ids:
             self._close_session(aid)
+
+    def set_proxy(self, account_id: int, proxy: str) -> dict:
+        """设置账号专属代理。空串表示清除 (回退到 ZAIBOT_PROXY 或直连)。
+
+        修改后立即销毁已有 CaptchaSession, 下次请求会用新代理重建浏览器。
+        """
+        proxy = (proxy or "").strip()
+        if proxy:
+            from urllib.parse import urlparse
+            p = urlparse(proxy)
+            if p.scheme.lower() not in ("socks5", "socks5h", "http", "https"):
+                return {"ok": False, "message": f"不支持的代理协议: {p.scheme!r} (仅支持 socks5/socks5h/http/https)"}
+            if not p.hostname or not p.port:
+                return {"ok": False, "message": f"代理地址缺少 host:port: {proxy!r}"}
+
+        acc = self.db.get_account(account_id)
+        if not acc:
+            return {"ok": False, "message": f"账号不存在: {account_id}"}
+
+        old = acc.proxy or ""
+        self.db.update_account(account_id, proxy=proxy)
+        # 代理变更 → 必须重建浏览器, 否则 Camoufox 还在用旧 proxy
+        if old != proxy:
+            self._close_session(account_id)
+            _logger.info("账号 %s 代理已更新: %r -> %r (session 已销毁)", acc.name, old, proxy)
+        return {"ok": True, "old": old, "new": proxy}
 
     def mark_request(
         self,

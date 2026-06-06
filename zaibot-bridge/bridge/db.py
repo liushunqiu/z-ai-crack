@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     err_rate_limit_count INTEGER DEFAULT 0,
     err_server_count    INTEGER DEFAULT 0,
     err_unknown_count   INTEGER DEFAULT 0,
+    cooldown_until  REAL    DEFAULT 0,
+    proxy           TEXT    DEFAULT '',
     created_at      REAL    NOT NULL,
     updated_at      REAL    NOT NULL
 );
@@ -74,6 +76,7 @@ _ACCOUNT_MIGRATIONS = [
     "ALTER TABLE accounts ADD COLUMN err_server_count INTEGER DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN err_unknown_count INTEGER DEFAULT 0",
     "ALTER TABLE accounts ADD COLUMN cooldown_until REAL DEFAULT 0",
+    "ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT ''",
 ]
 
 # 错误 kind -> 计数列名
@@ -124,6 +127,7 @@ class Account:
     err_server_count: int = 0
     err_unknown_count: int = 0
     cooldown_until: float = 0  # 风控冷却期结束时间戳
+    proxy: str = ""  # 账号专属代理, 格式 socks5://host:port 或 http://host:port
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Account":
@@ -225,6 +229,7 @@ class AccountDB:
         error_count_delta: Optional[int] = None,
         error_kind_delta: Optional[tuple[str, int]] = None,
         cooldown_until: Optional[float] = None,
+        proxy: Optional[str] = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -250,6 +255,8 @@ class AccountDB:
             sets.append(f"{col}={col}+?"); vals.append(delta)
         if cooldown_until is not None:
             sets.append("cooldown_until=?"); vals.append(cooldown_until)
+        if proxy is not None:
+            sets.append("proxy=?"); vals.append(proxy)
         if not sets:
             return
         sets.append("updated_at=?"); vals.append(time.time())
@@ -416,6 +423,7 @@ def account_to_public_dict(acc: Account) -> dict:
             "未知错误": acc.err_unknown_count,
         },
         "has_state_file": has_state,
+        "proxy": acc.proxy,
         "created_at": acc.created_at,
         "updated_at": acc.updated_at,
     }

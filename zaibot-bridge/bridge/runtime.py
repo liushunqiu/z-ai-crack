@@ -232,7 +232,7 @@ class ChatRuntimeService:
                     # 选路径: pure HTTP (urllib) vs DOM fetch (Camoufox)
                     if self.USE_PURE_HTTP:
                         _logger.info("Path: PURE HTTP (urllib, skip Camoufox fetch)")
-                        item_iter = self._pure_http_streaming(path, headers, body_str)
+                        item_iter = self._pure_http_streaming(path, headers, body_str, proxy=captcha_sess.proxy)
                     else:
                         _logger.info("Path: DOM FETCH (Camoufox persistent page)")
                         item_iter = captcha_sess.fetch_streaming(path, headers, body_str)
@@ -445,21 +445,32 @@ class ChatRuntimeService:
         """返回会话缓存统计。"""
         return self._sessions.stats()
 
-    def _pure_http_streaming(self, path: str, headers: dict, body: str) -> Iterator[dict]:
+    def _pure_http_streaming(self, path: str, headers: dict, body: str, *, proxy: Optional[str] = None) -> Iterator[dict]:
         """Pure-HTTP 路径: 用 urllib 流式请求 chat-completion, 绕过 Camoufox fetch。
 
         和 captcha_sess.fetch_streaming 产出同样的 {status, chunk} 字典格式,
         让下游 SSE 解析代码完全无感切换。
 
+        Args:
+            proxy: 账号专属代理 (socks5://... 或 http://...), 空表示直连或回退环境变量。
+
         适用: DOM-fetch 持续 F018 / verify_failed 但 pure HTTP 正常的场景。
         代价: TLS fingerprint 跟 captcha page 不严格一致, captcha 可能 verify_failed。
         """
+        from .socks_urllib import make_opener
+
+        # 回退链: acc.proxy > ZAIBOT_PROXY > HTTPS_PROXY > 直连
+        import os as _os
+        effective_proxy = proxy or _os.environ.get("ZAIBOT_PROXY") or _os.environ.get("HTTPS_PROXY") or _os.environ.get("https_proxy") or None
+
         url = f"https://chat.z.ai{path}" if path.startswith("/") else path
         req = urllib.request.Request(
             url, data=body.encode("utf-8"), headers=headers, method="POST",
         )
+        opener = make_opener(effective_proxy)
+        _logger.info("urllib opener: proxy=%s url=%s", effective_proxy or "(direct)", url[:80])
         try:
-            resp = urllib.request.urlopen(req, timeout=180)
+            resp = opener.open(req, timeout=180)
         except urllib.error.HTTPError as e:
             yield {"status": e.code, "type": "status"}
             try:
@@ -467,9 +478,17 @@ class ChatRuntimeService:
             except Exception:
                 pass
             return
+        except Exception as e:
+            # opener.open 抛 URLError / TimeoutError / socket.error 等
+            _logger.warning("urllib opener.open 失败: %s", e)
+            yield {"status": 0, "type": "status"}
+            yield {"chunk": f"[urllib error] {e}\n\n"}
+            return
 
-        yield {"status": resp.status, "type": "status"}
-        if resp.status >= 400:
+        # opener.open 成功返回的 resp 类似 urlopen 的 resp
+        status = getattr(resp, "status", None) or getattr(resp, "code", 200)
+        yield {"status": status, "type": "status"}
+        if status >= 400:
             try:
                 yield {"chunk": resp.read().decode("utf-8", "replace") + "\n\n"}
             except Exception:
