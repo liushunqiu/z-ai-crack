@@ -41,7 +41,7 @@ Sibling imports between `zaibot/` and `zaibot-bridge/` are done via `sys.path.in
 
 ## Environment Variables
 
-- `ZAIBOT_USE_PURE_HTTP=1` — Forces `zaibot-bridge` chat requests through `urllib` instead of Camoufox fetch. Useful when DOM-fetch hits F018 but pure HTTP works.
+- `ZAIBOT_USE_PURE_HTTP=1` — Forces `zaibot-bridge` chat requests through `urllib` instead of Camoufox fetch. **已废弃**：Aliyun WAF 现在做 TLS 指纹关联，PURE HTTP 会持续 verify_failed。仅作为 DOM Fetch 不可用时的应急回退。
 - `ZAIBOT_HMAC_SECRET` — Optional override for X-Signature HMAC key.
 
 ## Architecture Gotchas
@@ -49,7 +49,7 @@ Sibling imports between `zaibot/` and `zaibot-bridge/` are done via `sys.path.in
 - **Sticky binding**: `session_id` in API requests maps permanently to one Z.ai account via round-robin on first use. Changing the binding resets the conversation (`chat_id`).
 - **Captcha tokens are single-use**: Every chat completion request mints a fresh captcha token via per-account Camoufox browser.
 - **IP-level rate limiting**: `AccountManager` enforces a global cooldown across all accounts when multiple accounts fail in a short window.
-- **Pure HTTP vs DOM Fetch**: 默认 DOM Fetch 路径在无代理时可用。但使用代理时，**必须用 Pure HTTP + SOCKS5**（`ZAIBOT_USE_PURE_HTTP=1` + `ZAIBOT_PROXY=socks5://...`），让 urllib 和 Camoufox 浏览器从同一代理 IP 出去，否则 captcha 指纹绑定不匹配。DOM Fetch 路径下浏览器 `__nativeFetch` 会被 Aliyun WAF 拦截（405）。
+- **Pure HTTP vs DOM Fetch**: **推荐 DOM Fetch + SOCKS5 代理**（默认路径，不设 `ZAIBOT_USE_PURE_HTTP`）。Camoufox 浏览器同时拿 captcha 和发 chat API，TLS 指纹一致，WAF 不拦截。PURE HTTP 路径（`ZAIBOT_USE_PURE_HTTP=1`）会让 urllib 发 chat API，其 TLS 指纹与 Camoufox 浏览器不同，Aliyun WAF 现在会把 captcha session 和 chat API session 做指纹关联 → 持续 `verify_failed` / `FRONTEND_CAPTCHA_REQUIRED`。即使换全新 IP 也会失败，证明是 WAF 指纹策略升级，不是 IP 封禁。
 
 ## 风控规避策略（实测验证）
 
@@ -94,25 +94,20 @@ ZAIBOT_USE_PURE_HTTP=1 ZAIBOT_PROXY=socks5://127.0.0.1:33211 python3 server.py
 
 ### 推荐配置
 
-**最佳方案（Pure HTTP + SOCKS5 代理）：**
+**最佳方案（DOM Fetch + 每账号独立 SOCKS5 代理）：**
 ```bash
 cd zaibot-bridge
-ZAIBOT_USE_PURE_HTTP=1 ZAIBOT_PROXY=socks5://127.0.0.1:你的SOCKS5端口 ../.venv/bin/python3 server.py
+./start.sh
+# 或手动启动（不设 ZAIBOT_USE_PURE_HTTP）:
+ZAIBOT_PROXY=socks5://127.0.0.1:你的SOCKS5端口 ../.venv/bin/python3 server.py
 ```
-- Camoufox 浏览器走 SOCKS5 代理获取 captcha（geoip=True 自动匹配指纹）
-- urllib 通过 pysocks 全局走同一 SOCKS5 代理
-- 所有请求从同一代理 IP 出去，captcha 指纹绑定匹配
+- 在 admin UI（`http://localhost:8001/admin`）为每个账号单独设置 proxy 字段
+- Camoufox 浏览器走账号 proxy 拿 captcha，同一浏览器实例发 chat API
+- TLS 指纹一致 + 同 IP → WAF 不拦截
+- 多账号配多个不同出口 IP 的 SOCKS5 代理（每端口不同 IP）
 - 需要安装: `pip install pysocks` 和 `pip install camoufox[geoip]`
 
-**无代理场景（仅限低频率使用）：**
-- 请求间隔 ≥ 30 秒
-- 每小时不超过 10 次请求
-- 使用默认 DOM Fetch 路径（不设置 `ZAIBOT_USE_PURE_HTTP`）
-
-**多账号场景（推荐 ≥ 3 个账号 + 代理）：**
-- 每账号间隔 ≥ 30 秒
-- 全局间隔 ≥ 10 秒（不同账号轮换）
-- 每账号绑定不同代理出口 IP
+**注意：不要再使用 `ZAIBOT_USE_PURE_HTTP=1`。** Aliyun WAF 已升级，会把 captcha session（浏览器）和 chat API session（urllib）做 TLS 指纹关联 → 持续 verify_failed。
 
 **已实现的自动保护：**
 - `verify_failed` 退避：30s → 90s（`runtime.py`，修复前为 5s → 10s）
